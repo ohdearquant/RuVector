@@ -159,12 +159,9 @@ impl HnswIndex {
                                 })
                             })
                             .collect();
-                        scored.sort_by(|a, b| {
-                            a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
-                        });
+                        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
                         scored.truncate(self.config.m);
-                        *neighbor_connections =
-                            scored.into_iter().map(|(cid, _)| cid).collect();
+                        *neighbor_connections = scored.into_iter().map(|(cid, _)| cid).collect();
                     } else {
                         // Fallback: shouldn't happen because `neighbor.id` came
                         // from the index, but keep the newest-m behavior so we
