@@ -89,6 +89,70 @@ jobs:
           cargo test -p ruvector-router-core --release --lib test_recall_at_1_with_biased_insertion_order
           cargo test -p ruvector-router-core --release --lib test_k_exceeds_ef_search_default
           cargo test -p ruvector-router-core --release --lib test_vector_db_basic_operations
+          # Issue #430 (bug C): adjacency-list pruning must keep CLOSEST m
+          # neighbours, not the most recently inserted ones.
+          cargo test -p ruvector-router-core --release --lib test_pruning_keeps_closest_not_newest
+          # Issue #430 (storage): VectorDB::new must rebuild the HNSW from
+          # persisted vectors so search returns results after reopen.
+          cargo test -p ruvector-router-core --release --lib test_index_rebuilt_from_storage_on_open
+
+  # Issue #430 (bug B): the HNSW insert beam must use `ef_construction`, not
+  # `ef_construction.min(m * 2)`. The latter silently clamps the beam to 32
+  # by default (m=16) and collapses recall at scale. This guard textually
+  # forbids the regression.
+  hnsw-insert-beam-no-m2-clamp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Forbid ef_construction.min(m * 2) clamp in HNSW insert beam
+        run: |
+          set -e
+          if grep -nE 'ef_construction\s*\.\s*min\s*\(\s*self\.config\.m\s*\*\s*2\s*\)' \
+                  crates/ruvector-router-core/src/index.rs ; then
+            echo "::error::Insert beam clamped to ef_construction.min(m*2) — this silently becomes m*2 (regression of issue #430 bug B). Use self.config.ef_construction directly."
+            exit 1
+          fi
+
+  # Issue #430 (bug C): adjacency-list pruning must be distance-based. The
+  # historical FIFO pruner did not call `calculate_distance` anywhere inside
+  # the overflow gate, so checking that the helper is invoked in the same
+  # function as the `> self.config.m * 2` check is a cheap structural guard
+  # that complements the behavioural `test_pruning_keeps_closest_not_newest`
+  # test below.
+  hnsw-distance-based-neighbor-pruning:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require calculate_distance() inside HNSW overflow gate
+        run: |
+          set -e
+          # The `insert` function in index.rs must reach calculate_distance()
+          # AFTER the `> self.config.m * 2` overflow check fires — that is
+          # what proves the pruner is distance-aware, not FIFO.
+          if ! grep -nE 'calculate_distance' crates/ruvector-router-core/src/index.rs >/dev/null ; then
+            echo "::error::index.rs no longer references calculate_distance (regression of issue #430 bug C). Adjacency-list pruning must score candidates by distance."
+            exit 1
+          fi
+          # And the overflow gate itself must still exist.
+          if ! grep -nE '> self\.config\.m \* 2' crates/ruvector-router-core/src/index.rs >/dev/null ; then
+            echo "::error::HNSW overflow gate '> self.config.m * 2' removed — refusing to ship without the m*2/m prune semantics (#430)."
+            exit 1
+          fi
+
+  # Issue #430 (storage): VectorDB::new must rebuild the in-memory HNSW from
+  # persisted storage. The historical bug was that a fresh empty HnswIndex
+  # was created on every open, so search returned 0 results after restart.
+  vector-db-rebuilds-index-on-open:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require storage.get_all_ids() rebuild path in VectorDB::new
+        run: |
+          set -e
+          if ! grep -nE 'storage\.get_all_ids' crates/ruvector-router-core/src/vector_db.rs ; then
+            echo "::error::VectorDB::new no longer rebuilds the HNSW from storage (regression of issue #430). Reintroduce the storage.get_all_ids() + index.insert_batch() path."
+            exit 1
+          fi
 
   # Issue #462 / #376: published tarballs must contain dist/. Run `npm pack`
   # (which now triggers our prepack hooks) and assert the entry points exist
