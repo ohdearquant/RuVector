@@ -35,6 +35,7 @@ on:
     # so the two crates don't pile onto the GH Actions scheduler at
     # the same minute.
     - cron: '23 9 * * 2'
+  workflow_dispatch:
 
 permissions:
   contents: read
