@@ -266,8 +266,7 @@ pub struct ScoredDoc {
 /// Strategy for combining ranked lists from different retrieval systems.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum FusionStrategy {
-    /// Reciprocal Rank Fusion. `k` controls rank-pressure (default 15).
-    /// K=15 per Lean4 proof `ret010_k60_consensus_bias` — K=60 has consensus bias.
+    /// Reciprocal Rank Fusion. `k` controls rank-pressure (default 60).
     RRF { k: f32 },
     /// Weighted linear combination of normalised scores.
     Linear {
@@ -281,7 +280,7 @@ pub enum FusionStrategy {
 
 impl Default for FusionStrategy {
     fn default() -> Self {
-        FusionStrategy::RRF { k: 15.0 }
+        FusionStrategy::RRF { k: 60.0 }
     }
 }
 
