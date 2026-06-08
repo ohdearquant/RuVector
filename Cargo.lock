@@ -9459,6 +9459,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruvector-graph-condense"
+version = "2.2.3"
+dependencies = [
+ "criterion 0.5.1",
+ "rand 0.8.5",
+ "rayon",
+ "ruvector-mincut 2.2.3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ruvector-graph-condense-wasm"
+version = "2.2.3"
+dependencies = [
+ "getrandom 0.2.17",
+ "ruvector-graph-condense",
+ "ruvector-mincut 2.2.3",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "ruvector-graph-node"
 version = "2.2.3"
 dependencies = [
@@ -9868,6 +9893,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "ruvector-perception"
+version = "2.2.3"
+dependencies = [
+ "ruvector-mincut 2.2.3",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
