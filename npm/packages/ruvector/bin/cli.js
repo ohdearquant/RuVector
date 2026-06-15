@@ -1876,6 +1876,97 @@ program
   });
 
 // =============================================================================
+// Tiny Dancer - cost-optimal FastGRNN model router (train + route)
+// =============================================================================
+
+const tinyDancer = program
+  .command('tiny-dancer')
+  .alias('td')
+  .description('Cost-optimal FastGRNN model router — train from a DRACO dataset and route with it (requires @ruvector/tiny-dancer)');
+
+function loadTinyDancer() {
+  try {
+    return require('@ruvector/tiny-dancer');
+  } catch (e) {
+    console.error(chalk.red('\n  This command requires @ruvector/tiny-dancer'));
+    console.error(chalk.yellow('  Install it:  npm install @ruvector/tiny-dancer'));
+    console.error(chalk.dim('  (native router; ships for linux/macos/windows incl. musl + arm64)\n'));
+    process.exit(1);
+  }
+}
+
+tinyDancer
+  .command('train <draco>')
+  .description('Train a FastGRNN router from a DRACO dataset (rows of {embedding, scores}) into a .safetensors model')
+  .requiredOption('--out <path>', 'Output .safetensors model path')
+  .option('--input-dim <n>', 'Embedding/feature dimension (default: inferred from the first row)')
+  .option('--prices <json>', 'Price table as JSON or @file, e.g. \'{"haiku":1,"opus":15}\'')
+  .option('--epochs <n>', 'Training epochs', '40')
+  .option('--lr <n>', 'Learning rate', '0.05')
+  .option('--hidden <n>', 'Hidden dimension', '12')
+  .option('--tolerance <n>', 'Cheap-model "good enough" tolerance', '0.05')
+  .action(async (draco, options) => {
+    const td = loadTinyDancer();
+    const parsed = JSON.parse(fs.readFileSync(draco, 'utf8'));
+    const rows = Array.isArray(parsed) ? parsed : parsed.rows;
+    const prices = options.prices
+      ? JSON.parse(options.prices.startsWith('@') ? fs.readFileSync(options.prices.slice(1), 'utf8') : options.prices)
+      : (parsed.prices || {});
+    if (!Array.isArray(rows) || rows.length === 0) {
+      console.error(chalk.red('  DRACO file must contain rows of { embedding, scores }')); process.exit(1);
+    }
+    if (!prices || Object.keys(prices).length === 0) {
+      console.error(chalk.red('  Provide a price table via --prices or a "prices" field in the file')); process.exit(1);
+    }
+    const inputDim = options.inputDim ? parseInt(options.inputDim, 10) : (rows[0].embedding || []).length;
+    console.log(chalk.cyan(`\n  Training FastGRNN router: ${rows.length} rows, dim ${inputDim}`));
+    const res = await td.trainRouter(rows, prices, {
+      outputPath: options.out,
+      inputDim,
+      hiddenDim: parseInt(options.hidden, 10),
+      epochs: parseInt(options.epochs, 10),
+      learningRate: parseFloat(options.lr),
+      tolerance: parseFloat(options.tolerance),
+    });
+    console.log(chalk.green(`  ✓ trained: acc=${res.trainAccuracy.toFixed(3)} val=${res.valAccuracy.toFixed(3)} loss=${res.trainLoss.toFixed(4)}`));
+    console.log(chalk.white(`  ✓ saved:   ${res.modelPath} (${res.modelBytes} bytes, ${res.epochsRun} epochs)`));
+    console.log(chalk.gray(`  Load it:   new Router({ modelPath: '${res.modelPath}' })\n`));
+  });
+
+tinyDancer
+  .command('route <model>')
+  .description('Route a query through a trained model. --query: JSON embedding array; --candidates: JSON file of [{id, embedding}]')
+  .requiredOption('--query <json>', 'Query embedding as a JSON array or @file')
+  .requiredOption('--candidates <file>', 'Candidates JSON file: [{ id, embedding }]')
+  .option('--threshold <n>', 'Confidence threshold', '0.85')
+  .action(async (model, options) => {
+    const td = loadTinyDancer();
+    const queryEmbedding = JSON.parse(options.query.startsWith('@') ? fs.readFileSync(options.query.slice(1), 'utf8') : options.query);
+    const candidates = JSON.parse(fs.readFileSync(options.candidates, 'utf8'));
+    const router = new td.Router({ modelPath: model, confidenceThreshold: parseFloat(options.threshold) });
+    const resp = await router.route({ queryEmbedding, candidates });
+    console.log(chalk.cyan('\n  Routing decisions (best first):'));
+    for (const d of resp.decisions) {
+      console.log(`   ${chalk.white(d.candidateId)}  conf=${d.confidence.toFixed(3)}  light=${d.useLightweight}  unc=${d.uncertainty.toFixed(3)}`);
+    }
+    console.log(chalk.gray(`  inference ${resp.inferenceTimeUs}µs over ${resp.candidatesProcessed} candidates\n`));
+  });
+
+tinyDancer
+  .command('info')
+  .description('Show tiny-dancer availability and version')
+  .action(() => {
+    try {
+      const td = require('@ruvector/tiny-dancer');
+      console.log(chalk.green(`\n  @ruvector/tiny-dancer ${td.version()} — ${td.hello()}`));
+      console.log(chalk.gray('  train:  npx ruvector tiny-dancer train <draco.json> --out model.safetensors'));
+      console.log(chalk.gray('  route:  npx ruvector tiny-dancer route <model.safetensors> --query <emb> --candidates <file>\n'));
+    } catch {
+      console.log(chalk.yellow('\n  @ruvector/tiny-dancer not installed.  npm install @ruvector/tiny-dancer\n'));
+    }
+  });
+
+// =============================================================================
 // Server Commands - HTTP/gRPC server
 // =============================================================================
 
