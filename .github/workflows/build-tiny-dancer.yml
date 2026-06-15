@@ -155,7 +155,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          VERSION="0.1.15"
+          VERSION=$(node -p "require('./npm/packages/tiny-dancer/package.json').version")
           echo "Publishing version: $VERSION"
 
           for dir in artifacts/tiny-dancer-*/; do
@@ -236,6 +236,20 @@ jobs:
             fi
           done
           ls -la npm/packages/tiny-dancer/*.node || true
+
+      - name: Lock optionalDependencies to package version
+        working-directory: npm/packages/tiny-dancer
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = require("./package.json");
+            const v = p.version;
+            for (const k of Object.keys(p.optionalDependencies || {})) {
+              p.optionalDependencies[k] = v;
+            }
+            fs.writeFileSync("./package.json", JSON.stringify(p, null, 2) + "\n");
+            console.log("Locked optionalDependencies to " + v);
+          '
 
       - name: Publish main package
         working-directory: npm/packages/tiny-dancer
