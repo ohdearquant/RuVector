@@ -1934,22 +1934,21 @@ tinyDancer
   });
 
 tinyDancer
-  .command('route <model>')
-  .description('Route a query through a trained model. --query: JSON embedding array; --candidates: JSON file of [{id, embedding}]')
-  .requiredOption('--query <json>', 'Query embedding as a JSON array or @file')
-  .requiredOption('--candidates <file>', 'Candidates JSON file: [{ id, embedding }]')
-  .option('--threshold <n>', 'Confidence threshold', '0.85')
+  .command('score <model>')
+  .description('Score a query embedding with a trained model. High = the cheap model is good enough (route cheap)')
+  .requiredOption('--query <json>', 'Query embedding as a JSON array or @file (length must match the model input dim)')
+  .option('--threshold <n>', 'Decision threshold for cheap-vs-strong', '0.5')
   .action(async (model, options) => {
     const td = loadTinyDancer();
-    const queryEmbedding = JSON.parse(options.query.startsWith('@') ? fs.readFileSync(options.query.slice(1), 'utf8') : options.query);
-    const candidates = JSON.parse(fs.readFileSync(options.candidates, 'utf8'));
-    const router = new td.Router({ modelPath: model, confidenceThreshold: parseFloat(options.threshold) });
-    const resp = await router.route({ queryEmbedding, candidates });
-    console.log(chalk.cyan('\n  Routing decisions (best first):'));
-    for (const d of resp.decisions) {
-      console.log(`   ${chalk.white(d.candidateId)}  conf=${d.confidence.toFixed(3)}  light=${d.useLightweight}  unc=${d.uncertainty.toFixed(3)}`);
-    }
-    console.log(chalk.gray(`  inference ${resp.inferenceTimeUs}µs over ${resp.candidatesProcessed} candidates\n`));
+    const embedding = JSON.parse(options.query.startsWith('@') ? fs.readFileSync(options.query.slice(1), 'utf8') : options.query);
+    const s = await td.score(model, embedding);
+    const threshold = parseFloat(options.threshold);
+    console.log(chalk.cyan(`\n  score = ${s.toFixed(4)}`));
+    console.log(
+      s >= threshold
+        ? chalk.green('  → route to the CHEAP model (good enough)\n')
+        : chalk.yellow('  → route to a STRONGER model\n')
+    );
   });
 
 tinyDancer
@@ -1960,7 +1959,7 @@ tinyDancer
       const td = require('@ruvector/tiny-dancer');
       console.log(chalk.green(`\n  @ruvector/tiny-dancer ${td.version()} — ${td.hello()}`));
       console.log(chalk.gray('  train:  npx ruvector tiny-dancer train <draco.json> --out model.safetensors'));
-      console.log(chalk.gray('  route:  npx ruvector tiny-dancer route <model.safetensors> --query <emb> --candidates <file>\n'));
+      console.log(chalk.gray('  score:  npx ruvector tiny-dancer score <model.safetensors> --query <embedding.json>\n'));
     } catch {
       console.log(chalk.yellow('\n  @ruvector/tiny-dancer not installed.  npm install @ruvector/tiny-dancer\n'));
     }

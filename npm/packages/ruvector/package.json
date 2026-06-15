@@ -83,7 +83,7 @@
   },
   "optionalDependencies": {
     "@ruvector/rvf": "^0.1.0",
-    "@ruvector/tiny-dancer": "^0.1.21"
+    "@ruvector/tiny-dancer": "^0.1.22"
   },
   "devDependencies": {
     "@types/node": "^20.10.5",
