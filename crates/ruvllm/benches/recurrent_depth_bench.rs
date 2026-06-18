@@ -139,6 +139,46 @@ mod candle_bench {
         g.finish();
     }
 
+    // TTFT + long decode benchmarks — measure orchestration overhead at scale.
+    // Run: cargo bench --bench recurrent_depth_bench -- "cpu/decode_sweep"
+    pub fn bench_mythos_decode_sweep_cpu(c: &mut Criterion) {
+        use ruvllm::models::sampling::SamplingConfig;
+        let mut g = c.benchmark_group("cpu/mythos_decode_sweep_f32");
+        // Use a tighter sample size for long runs to stay under 5 minutes.
+        g.sample_size(10);
+        let cfg = mythos_cfg();
+        let model = rand_mythos_on(cfg.clone(), &Device::Cpu, DType::F32);
+        let prompt32: Vec<u32> = (0..32u32).collect();
+
+        // TTFT: time to first token (single decode step from prompt).
+        g.bench_function("prompt32_ttft", |b| {
+            b.iter(|| {
+                let out = model
+                    .generate(black_box(&prompt32), 1, cfg.max_loop_iters, None)
+                    .unwrap();
+                black_box(out);
+            })
+        });
+
+        // Throughput at increasing generation lengths.
+        for &gen_len in &[16usize, 64, 128] {
+            g.bench_with_input(
+                BenchmarkId::new("prompt32_gen", gen_len),
+                &gen_len,
+                |b, &n| {
+                    b.iter(|| {
+                        let out = model
+                            .generate(black_box(&prompt32), n, cfg.max_loop_iters, None)
+                            .unwrap();
+                        black_box(out);
+                    })
+                },
+            );
+        }
+
+        g.finish();
+    }
+
     pub fn bench_rdt_forward_cpu(c: &mut Criterion) {
         let mut g = c.benchmark_group("cpu/rdt_forward_f32");
         let model = rand_rdt_on(rdt_cfg(), &Device::Cpu, DType::F32);
@@ -351,6 +391,47 @@ mod candle_bench {
 
         g.finish();
     }
+
+    // CUDA long-decode + TTFT sweep (prompt 32, generate 1/16/64/128).
+    // Run: cargo bench --features candle,cuda --bench recurrent_depth_bench -- "cuda/decode_sweep"
+    #[cfg(feature = "cuda")]
+    pub fn bench_mythos_decode_sweep_cuda_bf16(c: &mut Criterion) {
+        let dev = cuda_device();
+        let cfg = mythos_cfg();
+        let model = rand_mythos_on(cfg.clone(), &dev, DType::BF16);
+        let prompt32: Vec<u32> = (0..32u32).collect();
+
+        let mut g = c.benchmark_group("cuda/mythos_decode_sweep_bf16");
+        g.sample_size(10);
+
+        // TTFT: single decode step from prompt.
+        g.bench_function("prompt32_ttft", |b| {
+            b.iter(|| {
+                let out = model
+                    .generate(black_box(&prompt32), 1, cfg.max_loop_iters, None)
+                    .unwrap();
+                black_box(out);
+            })
+        });
+
+        // Throughput at increasing generation lengths.
+        for &gen_len in &[16usize, 64, 128] {
+            g.bench_with_input(
+                BenchmarkId::new("prompt32_gen", gen_len),
+                &gen_len,
+                |b, &n| {
+                    b.iter(|| {
+                        let out = model
+                            .generate(black_box(&prompt32), n, cfg.max_loop_iters, None)
+                            .unwrap();
+                        black_box(out);
+                    })
+                },
+            );
+        }
+
+        g.finish();
+    }
 }
 
 // CPU criterion groups (always registered)
@@ -360,6 +441,7 @@ criterion_group!(
     candle_bench::bench_mythos_forward_cpu,
     candle_bench::bench_mythos_forward_mla_cpu,
     candle_bench::bench_mythos_decode_cpu,
+    candle_bench::bench_mythos_decode_sweep_cpu,
     candle_bench::bench_rdt_forward_cpu,
 );
 
@@ -370,6 +452,7 @@ criterion_group!(
     candle_bench::bench_mythos_forward_cuda_f32,
     candle_bench::bench_mythos_forward_cuda_bf16,
     candle_bench::bench_mythos_decode_cuda_bf16,
+    candle_bench::bench_mythos_decode_sweep_cuda_bf16,
     candle_bench::bench_rdt_forward_cuda_f32,
     candle_bench::bench_rdt_forward_cuda_bf16,
 );

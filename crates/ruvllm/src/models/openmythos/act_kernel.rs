@@ -343,3 +343,178 @@ impl FusedActKernel {
         Ok(v.iter().map(|&d| d as usize).collect())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Zero-copy path: use candle's public `Tensor::storage_and_layout()` +
+// `CudaDevice::cuda_stream()` to extract raw device pointers without H2D/D2H
+// staging transfers.
+//
+// candle 0.9 public surface used:
+//   Tensor::as_cuda_device() → &CudaDevice           (device.rs:238)
+//   CudaDevice::cuda_stream() → Arc<CudaStream>       (device.rs)
+//   Tensor::storage_and_layout() → (Guard<Storage>, &Layout)
+//   CudaStorage::as_cuda_slice::<T>() → &CudaSlice<T>
+//   DevicePtr::device_ptr(&stream) → (CUdeviceptr, SyncOnDrop)
+//
+// No workspace patch to candle is required.  The SyncOnDrop guard MUST be
+// kept alive through the kernel launch (it syncs the stream on drop, which
+// ensures the kernel sees the pointer).
+// ---------------------------------------------------------------------------
+
+/// Call `f(raw_ptr_u64)` with the raw CUDA device pointer for a contiguous
+/// F32 tensor, holding all lifetime guards alive for the duration of the call.
+///
+/// The `SyncOnDrop` guard returned by `device_ptr()` is dropped AFTER `f`
+/// returns — it triggers a stream sync that serializes any downstream reads.
+///
+/// # Safety
+/// Caller must ensure the tensor is contiguous, on CUDA, and dtype F32.
+pub unsafe fn with_tensor_f32_ptr<R, F: FnOnce(u64) -> R>(
+    tensor: &Tensor,
+    f: F,
+) -> Result<R> {
+    use candle_core::Storage;
+    use cudarc::driver::DevicePtr;
+
+    let cuda_dev = tensor
+        .device()
+        .as_cuda_device()
+        .map_err(|e| RuvLLMError::Model(format!("not CUDA: {e}")))?;
+    let stream = cuda_dev.cuda_stream();
+
+    let (storage, layout) = tensor.storage_and_layout();
+    let Storage::Cuda(ref cs) = *storage else {
+        return Err(RuvLLMError::Model("tensor not on CUDA device".into()));
+    };
+    let slice = cs
+        .as_cuda_slice::<f32>()
+        .map_err(|e| RuvLLMError::Model(format!("dtype: {e}")))?;
+
+    let offset_bytes = (layout.start_offset() * 4) as u64;
+    let (base_ptr, _guard) = slice.device_ptr(&stream);
+    // f is called before _guard (and storage, stream) are dropped — pointer valid.
+    let result = f(base_ptr + offset_bytes);
+    // _guard dropped here: syncs stream so downstream operations see the data.
+    Ok(result)
+}
+
+/// Same callback pattern for BF16 tensors (pointer is `*const u16` equivalent).
+pub unsafe fn with_tensor_bf16_ptr<R, F: FnOnce(u64) -> R>(
+    tensor: &Tensor,
+    f: F,
+) -> Result<R> {
+    use candle_core::Storage;
+    use cudarc::driver::DevicePtr;
+    use half::bf16;
+
+    let cuda_dev = tensor
+        .device()
+        .as_cuda_device()
+        .map_err(|e| RuvLLMError::Model(format!("not CUDA: {e}")))?;
+    let stream = cuda_dev.cuda_stream();
+
+    let (storage, layout) = tensor.storage_and_layout();
+    let Storage::Cuda(ref cs) = *storage else {
+        return Err(RuvLLMError::Model("tensor not on CUDA device".into()));
+    };
+    let slice = cs
+        .as_cuda_slice::<bf16>()
+        .map_err(|e| RuvLLMError::Model(format!("dtype: {e}")))?;
+
+    let offset_bytes = (layout.start_offset() * 2) as u64;
+    let (base_ptr, _guard) = slice.device_ptr(&stream);
+    let result = f(base_ptr + offset_bytes);
+    Ok(result)
+}
+
+/// Zero-copy ACT kernel: `p` and `w_out` are Candle tensors on the same CUDA
+/// device — no H2D/D2H staging copies. State (`cum`, `not_halted`, `depth`)
+/// lives in cudarc `CudaSlice<f32>` buffers on a separate context but the
+/// same physical GPU (device 0).
+///
+/// Returns the weight tensor `w_out` as a pre-allocated Candle tensor that the
+/// caller passes directly to `h.broadcast_mul(&w)`.
+///
+/// # Remaining limitation
+/// The ACT state buffers (`cum`, `not_halted`, `depth`) are still on a separate
+/// cudarc context from candle's tensors.  A full zero-copy solution requires
+/// allocating state via candle or unifying contexts — tracked in ADR-258.
+pub struct FusedActZeroCopy {
+    kernel: FusedActKernel,
+    /// Pre-allocated Candle tensor for `w_out` on the model's CUDA device.
+    w_candle: Tensor,
+}
+
+impl FusedActZeroCopy {
+    /// Allocate zero-copy ACT state for `n = b * seq` positions.
+    /// `device` must be a CUDA device.
+    pub fn new(n: usize, device: &candle_core::Device) -> Result<Self> {
+        let kernel = FusedActKernel::new(n)?;
+        let w_candle = candle_core::Tensor::zeros((n,), DType::F32, device)
+            .map_err(|e| RuvLLMError::Model(format!("w_candle alloc: {e}")))?;
+        Ok(Self { kernel, w_candle })
+    }
+
+    /// Run one ACT step with zero-copy tensor access for `p`.
+    ///
+    /// `p_tensor`: `[b, seq, 1]` F32 or BF16, must be contiguous, on CUDA.
+    /// Returns `w`: the pre-allocated `[n]` F32 Candle tensor (re-used each call).
+    pub fn step_zero_copy(
+        &mut self,
+        p_tensor: &Tensor,
+        threshold: f32,
+        t: usize,
+    ) -> Result<&Tensor> {
+        let n_i32 = self.kernel.n as i32;
+        let step_f32 = (t + 1) as f32;
+        let cfg = LaunchConfig::for_num_elems(self.kernel.n as u32);
+
+        // Zero-copy: get raw device pointers directly, no H2D/D2H staging.
+        // The callback guards sync their respective streams on return.
+        match p_tensor.dtype() {
+            DType::F32 => {
+                let f = self
+                    .kernel
+                    .module
+                    .load_function("act_fused_step_f32")
+                    .map_err(|e| RuvLLMError::Model(format!("load_function: {e}")))?;
+                let kernel = &mut self.kernel;
+                let w_candle = &self.w_candle;
+                unsafe {
+                    with_tensor_f32_ptr(p_tensor, |p_ptr| {
+                        with_tensor_f32_ptr(w_candle, |w_ptr| {
+                            kernel
+                                .stream
+                                .launch_builder(&f)
+                                .arg(&p_ptr)
+                                .arg(&mut kernel.cum)
+                                .arg(&mut kernel.not_halted)
+                                .arg(&mut kernel.depth)
+                                .arg(&w_ptr)
+                                .arg(&n_i32)
+                                .arg(&threshold)
+                                .arg(&step_f32)
+                                .launch(cfg)
+                        })
+                    })
+                }
+                .map_err(|e| RuvLLMError::Model(format!("zero-copy launch: {e}")))?
+                .map_err(|e| RuvLLMError::Model(format!("inner launch: {e}")))?
+                .map_err(|e| RuvLLMError::Model(format!("kernel: {e}")))?;
+            }
+            other => {
+                return Err(RuvLLMError::Model(format!(
+                    "zero-copy ACT: dtype {other:?} not yet supported (add BF16 with_tensor_bf16_ptr)"
+                )));
+            }
+        }
+        Ok(&self.w_candle)
+    }
+
+    pub fn all_halted(&self) -> Result<bool> {
+        self.kernel.all_halted()
+    }
+    pub fn depths(&self) -> Result<Vec<usize>> {
+        self.kernel.depths()
+    }
+}

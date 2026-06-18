@@ -145,6 +145,58 @@ After PR #589 merged, a `/loop 5m until sota` sweep added the following improvem
 
 ---
 
+## Conclusion
+
+ADR-258 demonstrates that recurrent-depth inference becomes practical when the adaptive
+control path remains GPU-resident. The original bottleneck was not the recurrent
+architecture itself, but host-mediated ACT state management, repeated cache concatenation,
+and unnecessary logits transfer during decoding.
+
+The sweep replaced CPU-side halt tracking with tensorized GPU state, cached static tensors
+at load time, pre-allocated KV buffers using scatter writes, reduced decode transfers, and
+added an optional fused CUDA ACT kernel. On RTX 5080, CUDA BF16 prefill reached **4.2×–21.3×
+speedup** over CPU F32 across OpenMythos GQA and RDT Shared benchmarks. Decode improved more
+modestly (+15% CPU, +9.4% CUDA on prompt-32-gen-16), indicating that decode is now
+increasingly limited by per-token orchestration overhead rather than bandwidth.
+
+The result validates RDT as a viable local test-time compute primitive. The key claim:
+
+> **RDT is only slow when the recurrent loop lives on the CPU. Once halt state, depth
+> accounting, KV writes, and sampling stay on GPU, recurrent depth becomes a practical
+> test-time compute primitive for local inference.**
+
+---
+
+## Next Phase (priority order)
+
+| Move | Impact | Risk | Priority |
+|------|-------:|-----:|---------:|
+| CUDA Graph capture for decode | Very high | Medium | P0 |
+| Upstream `Tensor::cuda_device_ptr()` for zero-copy fused ACT | High | Low | P0 |
+| Long decode benchmark suite (gen-128, gen-512, gen-1024, gen-4096) | High | Low | P0 |
+| Flash Attention for seq > 512 | Very high | High | P1 |
+| INT8/INT4 quantization | Very high | High | P1 |
+| Pre-repeated KV buffer (break-even ~1000 tokens) | Medium | Medium | P2 |
+
+**Acceptance test for "SOTA credible":**
+RTX 5080, same model shape, same prompt set, generate 512 tokens: ruvllm RDT BF16 beats
+baseline Candle transformer by ≥25% tokens/sec at equal or better loss, with no GPU→CPU
+sync in the ACT hot path and no per-token CUDA allocation.
+
+### Required benchmarks before claiming SOTA vs inference runtimes
+
+1. TTFT at prompt 32, 128, 512, 2048
+2. Tokens/sec at generate 16, 128, 512, 1024
+3. Peak VRAM per context length
+4. CUDA allocation count per token
+5. Kernel launch count per decode step
+6. ACT average depth distribution across workloads
+7. Accuracy / loss delta between F32, BF16, and fused-ACT paths
+8. Determinism: ≤ 0.01 logit variance across 10 identical runs
+9. Thermal steady state throughput after 10 minutes sustained generation
+
+---
+
 ## Alternatives Considered
 
 **Periodic early-exit check (every 4 iterations)**  
@@ -152,6 +204,9 @@ Reduces GPU→CPU syncs to ~25% of iterations. Rejected because: (a) it makes te
 
 **Separate GPU/CPU code paths**  
 Maintain the original CPU-only loop and add a GPU-specific branch gated on `device.is_cuda()`. Rejected — the vectorized tensor path works correctly and efficiently on both devices. Duplicating logic would add maintenance burden without measurable CPU benefit.
+
+**Pre-repeated KV buffer (n_heads-sized)**  
+Storing `[b, n_heads, max_seq, head_dim]` (pre-repeated KV) was attempted to eliminate `repeat_kv` per step. Reverted: the larger buffer (4× bigger for n_rep=4) caused a net regression on short generations (≤48 tokens) because allocation cost exceeded savings. Break-even is ~1000 decode tokens. Worth revisiting for long-context workloads.
 
 **Removing MoE in BF16 path**  
 Downgrade MoE to dense FFN when model dtype is non-F32. Rejected — the fix is one line (`.to_dtype(F32)`) and preserves model fidelity.
