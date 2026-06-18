@@ -220,7 +220,7 @@ impl RecurrentBlock {
         let mut cum_f32 = Tensor::zeros((b, seq, 1), DType::F32, &device).map_err(cand)?;
         let mut not_halted_f32 = Tensor::ones((b, seq, 1), DType::F32, &device).map_err(cand)?;
         let mut depth_f32 = Tensor::zeros((b, seq, 1), DType::F32, &device).map_err(cand)?;
-        let ones_f32 = Tensor::ones((b, seq, 1), DType::F32, &device).map_err(cand)?;
+        // `ones_f32` removed — replaced by affine(-1, 1) = (1 - x) without a constant tensor.
 
         // Precompute step tensors (t+1) for depth tracking — avoids Tensor::new per iteration.
         let step_tensors: Vec<Tensor> = (0..n_loops)
@@ -271,7 +271,8 @@ impl RecurrentBlock {
             //   newly halting: w = 1 − cumulative_before_this_step
             //   still running: w = p
             //   already halted: w = 0 (not_halted_f32 = 0 for them)
-            let remainder = (&ones_f32 - &cum_f32).map_err(cand)?;
+            // affine(-1, 1) = 1 - cum_f32, avoids a constant ones tensor.
+            let remainder = cum_f32.affine(-1.0, 1.0).map_err(cand)?;
             let w_halt = (&will_halt * &remainder).map_err(cand)?;
             let still_running = (&not_halted_f32 - &will_halt).map_err(cand)?;
             let w_run = (&still_running * &p_eff).map_err(cand)?;
@@ -319,7 +320,7 @@ impl RecurrentBlock {
             .map_err(cand)?;
         if remaining_final > 0.5 {
             let tail_f32 =
-                (&(&ones_f32 - &cum_f32).map_err(cand)? * &not_halted_f32).map_err(cand)?;
+                (cum_f32.affine(-1.0, 1.0).map_err(cand)? * &not_halted_f32).map_err(cand)?;
             let w = if dtype != DType::F32 {
                 tail_f32.to_dtype(dtype).map_err(cand)?
             } else {
