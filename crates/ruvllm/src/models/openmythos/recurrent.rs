@@ -15,38 +15,38 @@ use crate::models::rdt::DepthTelemetry;
 /// recurrence: `h_{t+1} = A·h_t + B·e + transformer_out`, with diagonal
 /// `A = exp(-exp(log_dt + log_A)) ∈ (0, 1)`.
 pub struct LtiInjection {
-    log_a: Tensor,
-    log_dt: Tensor,
+    /// Cached diagonal `A = exp(-exp(clamp(log_dt+log_A, -20, 20)))` `[dim]`.
+    /// Computed once at load time; the weights are frozen after training.
+    a_diag_cached: Tensor,
     b_gain: Tensor,
 }
 
 impl LtiInjection {
     pub fn load(vb: VarBuilder, dim: usize) -> Result<Self> {
-        Ok(Self {
-            log_a: vb.get(dim, "log_a").map_err(cand)?,
-            log_dt: vb.get(dim, "log_dt").map_err(cand)?,
-            b_gain: vb.get(dim, "b_gain").map_err(cand)?,
-        })
-    }
-
-    /// Diagonal `A ∈ (0,1)^dim`. The pre-activation is clamped to `[-20, 20]`
-    /// to avoid f32 overflow in the double exponential.
-    pub fn a_diag(&self) -> Result<Tensor> {
-        let s = (&self.log_dt + &self.log_a)
+        let log_a = vb.get(dim, "log_a").map_err(cand)?;
+        let log_dt = vb.get(dim, "log_dt").map_err(cand)?;
+        let b_gain = vb.get(dim, "b_gain").map_err(cand)?;
+        // Precompute the contractive diagonal — constant for fixed weights.
+        let a_diag_cached = (&log_dt + &log_a)
             .map_err(cand)?
             .clamp(-20.0, 20.0)
-            .map_err(cand)?;
-        s.exp()
+            .map_err(cand)?
+            .exp()
             .map_err(cand)?
             .neg()
             .map_err(cand)?
             .exp()
-            .map_err(cand)
+            .map_err(cand)?;
+        Ok(Self { a_diag_cached, b_gain })
+    }
+
+    /// Cached diagonal `A ∈ (0,1)^dim`.
+    pub fn a_diag(&self) -> Result<Tensor> {
+        Ok(self.a_diag_cached.clone())
     }
 
     pub fn forward(&self, h: &Tensor, e: &Tensor, trans_out: &Tensor) -> Result<Tensor> {
-        let a = self.a_diag()?;
-        let a_h = h.broadcast_mul(&a).map_err(cand)?;
+        let a_h = h.broadcast_mul(&self.a_diag_cached).map_err(cand)?;
         let b_e = e.broadcast_mul(&self.b_gain).map_err(cand)?;
         ((a_h + b_e).map_err(cand)? + trans_out).map_err(cand)
     }
