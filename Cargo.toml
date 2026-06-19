@@ -228,8 +228,6 @@ members = [
     "crates/ruvllm_retrieval_diffusion",
     # RAIRS IVF: Redundant Assignment + Amplified Inverse Residual (ADR-193)
     "crates/ruvector-rairs",
-    # BET 4 (SepRAG #534): LB-B&B IVF probing vs plain IVF nprobe
-    "crates/ruvector-bet4-ivf-bench",
     # Structure-preserving graph condensation via dynamic min-cut communities
     "crates/ruvector-graph-condense",
     "crates/ruvector-graph-condense-wasm",
@@ -238,8 +236,12 @@ members = [
     # Calculus of emergent / relational time (Wheeler-DeWitt, Page-Wootters,
     # entropic, thermal) + Structural Proper Time for agentic systems.
     "crates/emergent-time",
-    # Online HNSW graph repair after vector deletions (ADR-258)
-    "crates/ruvector-hnsw-repair",
+    # PhotonLayer: learned optical-frontend computing simulator (ADR-260)
+    "crates/photonlayer-core",
+    "crates/photonlayer-bench",
+    "crates/photonlayer-ruvector",
+    "crates/photonlayer-cli",
+    "crates/photonlayer-wasm",
 ]
 resolver = "2"
 
@@ -247,7 +249,7 @@ resolver = "2"
 unused_unit = "allow"
 
 [workspace.package]
-version = "2.3.0"
+version = "2.2.3"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT"
