@@ -35,8 +35,7 @@ impl CandidateGraph {
         // Cosine similarity is symmetric: sim(i,j) == sim(j,i). Compute each
         // pair once (upper triangle) and push it into both neighbour lists,
         // halving the dot-product work vs. the naive O(n²) double computation.
-        let mut sims: Vec<Vec<(usize, f32)>> =
-            vec![Vec::with_capacity(n.saturating_sub(1)); n];
+        let mut sims: Vec<Vec<(usize, f32)>> = vec![Vec::with_capacity(n.saturating_sub(1)); n];
         for i in 0..n {
             let (vi, ni) = (&candidates[i].vector, norms[i]);
             for j in (i + 1)..n {

@@ -32,7 +32,9 @@ fn build_candidate_sets() -> (Vec<Vec<f32>>, Vec<Vec<Candidate>>) {
     let queries: Vec<Vec<f32>> = (0..N_SETS)
         .map(|_| {
             let base = &corpus[rng.gen_range(0..CORPUS)];
-            base.iter().map(|&x| x + rng.gen_range(-0.1_f32..0.1)).collect()
+            base.iter()
+                .map(|&x| x + rng.gen_range(-0.1_f32..0.1))
+                .collect()
         })
         .collect();
     let noise = Normal::new(0.0_f32, 0.40).unwrap();
@@ -51,14 +53,22 @@ fn build_candidate_sets() -> (Vec<Vec<f32>>, Vec<Vec<Candidate>>) {
             scored
                 .into_iter()
                 .take(RETRIEVAL_K)
-                .map(|(id, s)| Candidate { id: id as u32, vector: corpus[id].clone(), noisy_score: s })
+                .map(|(id, s)| Candidate {
+                    id: id as u32,
+                    vector: corpus[id].clone(),
+                    noisy_score: s,
+                })
                 .collect::<Vec<_>>()
         })
         .collect();
     (queries, sets)
 }
 
-fn time_reranker<R: CandidateReranker>(r: &R, queries: &[Vec<f32>], sets: &[Vec<Candidate>]) -> f64 {
+fn time_reranker<R: CandidateReranker>(
+    r: &R,
+    queries: &[Vec<f32>],
+    sets: &[Vec<Candidate>],
+) -> f64 {
     // warm up
     for (q, c) in queries.iter().zip(sets).take(16) {
         let _ = r.rerank(q, c, K).unwrap();
@@ -83,9 +93,18 @@ fn rerank_latency_throughput() {
     let gnn_us = time_reranker(&GnnDiffusionReranker::default(), &queries, &sets);
 
     eprintln!("rerank latency (DIM={DIM}, candidates={RETRIEVAL_K}, k={K}, n={N_SETS}):");
-    eprintln!("  NoisyScore   {noisy_us:8.2} µs/q   {:.2} M QPS", 1.0 / noisy_us);
-    eprintln!("  GnnDiffusion {gnn_us:8.2} µs/q   {:.2} M QPS", 1.0 / gnn_us);
-    eprintln!("  diffusion overhead: {:.1}× baseline", gnn_us / noisy_us.max(1e-6));
+    eprintln!(
+        "  NoisyScore   {noisy_us:8.2} µs/q   {:.2} M QPS",
+        1.0 / noisy_us
+    );
+    eprintln!(
+        "  GnnDiffusion {gnn_us:8.2} µs/q   {:.2} M QPS",
+        1.0 / gnn_us
+    );
+    eprintln!(
+        "  diffusion overhead: {:.1}× baseline",
+        gnn_us / noisy_us.max(1e-6)
+    );
 
     assert!(
         gnn_us < BUDGET_US,

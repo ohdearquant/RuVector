@@ -10,9 +10,7 @@ use std::collections::HashSet;
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::{Distribution, Normal};
-use ruvector_gnn_rerank::{
-    Candidate, CandidateReranker, GnnDiffusionReranker, NoisyScoreReranker,
-};
+use ruvector_gnn_rerank::{Candidate, CandidateReranker, GnnDiffusionReranker, NoisyScoreReranker};
 
 const N: usize = 5_000;
 const DIM: usize = 128;
@@ -44,7 +42,9 @@ fn gen_queries(corpus: &[Vec<f32>], n_queries: usize, seed: u64) -> Vec<Vec<f32>
     (0..n_queries)
         .map(|_| {
             let base = &corpus[rng.gen_range(0..corpus.len())];
-            base.iter().map(|&x| x + rng.gen_range(-0.1_f32..0.1)).collect()
+            base.iter()
+                .map(|&x| x + rng.gen_range(-0.1_f32..0.1))
+                .collect()
         })
         .collect()
 }
@@ -79,12 +79,24 @@ fn noisy_retrieve(
     scored
         .into_iter()
         .take(retrieval_k)
-        .map(|(id, noisy_score)| Candidate { id: id as u32, vector: corpus[id].clone(), noisy_score })
+        .map(|(id, noisy_score)| Candidate {
+            id: id as u32,
+            vector: corpus[id].clone(),
+            noisy_score,
+        })
         .collect()
 }
 
-fn recall_at_k(results: &[ruvector_gnn_rerank::RankedResult], gt: &HashSet<usize>, k: usize) -> f64 {
-    let hits = results.iter().take(k).filter(|r| gt.contains(&(r.id as usize))).count();
+fn recall_at_k(
+    results: &[ruvector_gnn_rerank::RankedResult],
+    gt: &HashSet<usize>,
+    k: usize,
+) -> f64 {
+    let hits = results
+        .iter()
+        .take(k)
+        .filter(|r| gt.contains(&(r.id as usize)))
+        .count();
     hits as f64 / gt.len().min(k) as f64
 }
 

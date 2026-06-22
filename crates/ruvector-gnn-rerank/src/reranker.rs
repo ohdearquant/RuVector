@@ -71,10 +71,14 @@ fn validate(candidates: &[Candidate], k: usize) -> Result<(), RerankerError> {
             });
         }
         if !c.noisy_score.is_finite() {
-            return Err(RerankerError::NonFinite { what: "candidate score" });
+            return Err(RerankerError::NonFinite {
+                what: "candidate score",
+            });
         }
         if c.vector.iter().any(|x| !x.is_finite()) {
-            return Err(RerankerError::NonFinite { what: "candidate vector" });
+            return Err(RerankerError::NonFinite {
+                what: "candidate vector",
+            });
         }
     }
     Ok(())
