@@ -341,31 +341,38 @@ fn spawn_worker(
             let cfg = to_generate_config(&job.params);
             match job.reply {
                 Reply::Once(tx) => {
-                    let text = match StopScan::new(&cfg.stop_strings) {
+                    let result = match StopScan::new(&cfg.stop_strings) {
                         // No stop strings: the plain accumulate-everything path.
-                        None => metal.generate(&job.prompt, &tokenizer, &cfg).text,
+                        None => metal
+                            .generate(&job.prompt, &tokenizer, &cfg)
+                            .map(|out| out.text),
                         // Stop strings requested: drive the streaming loop so a
                         // match actually HALTS generation (StopScan doc above),
                         // instead of truncating after a full max_tokens run.
                         Some(mut scan) => {
                             let mut text = String::new();
-                            metal.generate_streaming_with_cancel(
-                                &job.prompt,
-                                &tokenizer,
-                                &cfg,
-                                |delta, _id| {
-                                    text.push_str(&scan.push(delta));
-                                    !scan.stopped
-                                },
-                                || false,
-                            );
-                            if !scan.stopped {
-                                text.push_str(&scan.finish());
-                            }
-                            text
+                            metal
+                                .generate_streaming_with_cancel(
+                                    &job.prompt,
+                                    &tokenizer,
+                                    &cfg,
+                                    |delta, _id| {
+                                        text.push_str(&scan.push(delta));
+                                        !scan.stopped
+                                    },
+                                    || false,
+                                )
+                                .map(|_| {
+                                    if !scan.stopped {
+                                        text.push_str(&scan.finish());
+                                    }
+                                    text
+                                })
                         }
                     };
-                    let _ = tx.send(Ok(text));
+                    let _ = tx.send(result.map_err(|e| {
+                        RuvLLMError::Backend(format!("lattice generation failed: {e}"))
+                    }));
                 }
                 Reply::Stream(tx) => {
                     let start = Instant::now();
@@ -375,7 +382,7 @@ fn spawn_worker(
                     // of the token whose delta released it (approximate but
                     // monotone); the flushed tail reuses the last seen id.
                     let mut last_id = 0u32;
-                    let out = metal.generate_streaming_with_cancel(
+                    let result = metal.generate_streaming_with_cancel(
                         &job.prompt,
                         &tokenizer,
                         &cfg,
@@ -400,6 +407,15 @@ fn spawn_worker(
                         },
                         || false,
                     );
+                    let out = match result {
+                        Ok(out) => out,
+                        Err(e) => {
+                            let _ = tx.send(StreamEvent::Error(format!(
+                                "lattice generation failed: {e}"
+                            )));
+                            continue;
+                        }
+                    };
                     if let Some(s) = scan.as_mut() {
                         if !s.stopped {
                             let tail = s.finish();
