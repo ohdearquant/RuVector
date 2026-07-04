@@ -40,7 +40,7 @@
 
 use super::{
     GenerateParams, GeneratedToken, LlmBackend, ModelArchitecture, ModelConfig, ModelInfo,
-    Quantization, SpecialTokens, StreamEvent, Tokenizer, TokenStream,
+    Quantization, SpecialTokens, StreamEvent, TokenStream, Tokenizer,
 };
 use crate::error::{Result, RuvLLMError};
 
@@ -709,7 +709,7 @@ mod tests {
         assert_eq!(s.push("abST"), "a"); // "bST" retained
         assert!(!s.stopped);
         assert_eq!(s.push("x"), "b"); // "STx" retained
-        // It never completes; finish() releases the held-back tail.
+                                      // It never completes; finish() releases the held-back tail.
         assert_eq!(s.finish(), "STx");
         assert!(!s.stopped);
     }

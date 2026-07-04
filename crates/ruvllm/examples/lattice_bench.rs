@@ -23,15 +23,48 @@
 //! acquires that lock (via a raw `flock(2)` FFI call — see `gpu_lock`
 //! below — no new crate dependency) before touching either backend.
 //!
+//! ## Getting a model to bench (lattice backend)
+//!
+//! The lattice backend loads a local directory containing `tokenizer.json` +
+//! `config.json`, plus either a Qwen3.5 safetensors checkpoint (f16) or a
+//! lattice Q4 weight set (`*.q4` files).
+//!
+//! Fastest path, no quantization needed (f16 safetensors straight from HF):
+//!
+//! ```bash
+//! pip install -U "huggingface_hub[cli]"
+//! huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir ~/.lattice/models/qwen3.5-0.8b
+//! ```
+//!
+//! For the Q4 numbers you must quantize the checkpoint yourself with
+//! lattice's streaming quantizer, then copy the tokenizer/config next to the
+//! `.q4` output (the quantizer writes only weights):
+//!
+//! ```bash
+//! cargo install lattice-inference --features metal-gpu,f16   # installs quantize_q4
+//! quantize_q4 \
+//!     --model-dir ~/.lattice/models/qwen3.5-0.8b \
+//!     --output-dir ~/.lattice/models/qwen3.5-0.8b-q4
+//! cp ~/.lattice/models/qwen3.5-0.8b/{tokenizer.json,config.json} \
+//!     ~/.lattice/models/qwen3.5-0.8b-q4/
+//! ```
+//!
 //! ## Usage
 //!
 //! ```bash
 //! cargo run -p ruvllm --release --features lattice --example lattice_bench -- \
-//!     --backend lattice --model /path/to/qwen3.5-0.8b-q4
+//!     --backend lattice --model ~/.lattice/models/qwen3.5-0.8b-q4
 //!
 //! cargo run -p ruvllm --release --features candle --example lattice_bench -- \
 //!     --backend candle --model /path/to/llama-3.2-1b
 //! ```
+//!
+//! Flags: `--max-tokens N` (default 128), `--runs N` (default 3, median
+//! reported), `--warmup N` (default 1), `--prompt "..."`. Set `BENCH_GREEDY=1`
+//! to decode greedily (top_k=1, temperature=0) — use this when comparing
+//! against standalone-engine numbers so sampling cost does not skew the
+//! comparison; default sampling adds meaningful per-token CPU cost on
+//! lattice's 248k vocabulary.
 #![allow(clippy::too_many_arguments)]
 
 use std::path::PathBuf;

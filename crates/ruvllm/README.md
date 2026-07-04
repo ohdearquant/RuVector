@@ -193,6 +193,16 @@ let params = GenerateParams::default()
 let response = backend.generate("Hello, world!", params)?;
 ```
 
+#### Benchmarking it
+
+`examples/lattice_bench.rs` measures load time, TTFT, and decode throughput.
+Its doc header walks through preparing a model: download Qwen3.5-0.8B from
+HuggingFace for the f16 path, or quantize it yourself with lattice's
+`quantize_q4` (installed via `cargo install lattice-inference --features
+metal-gpu,f16`) and copy `tokenizer.json` + `config.json` next to the `.q4`
+output. Run with `BENCH_GREEDY=1` for apples-to-apples comparison against
+standalone-engine numbers.
+
 `generate_stream_v2` streams every decoded token in real time via the real
 autoregressive decode loop (unlike the candle backend's `generate_stream_v2`,
 which samples exactly one token from the initial prefill logits then sends
