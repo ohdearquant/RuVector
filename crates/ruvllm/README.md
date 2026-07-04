@@ -151,7 +151,7 @@ See [`ruvllm_sparse_attention`](../ruvllm_sparse_attention/README.md) for the fu
 | Feature | Description |
 |---------|-------------|
 | `candle` | Enable Candle backend (HuggingFace) |
-| `lattice` | Enable Lattice backend (pure-Rust Qwen3.5, Metal — macOS only) |
+| `lattice` | Enable Lattice backend (pure-Rust Qwen3.5, Metal, macOS only) |
 | `metal` | Apple Silicon GPU acceleration via Candle |
 | `metal-compute` | Native Metal compute shaders (M4 Pro optimized) |
 | `cuda` | NVIDIA GPU acceleration |
@@ -173,9 +173,9 @@ See [`ruvllm_sparse_attention`](../ruvllm_sparse_attention/README.md) for the fu
 
 [Lattice](https://crates.io/crates/lattice-inference) is a pure-Rust Qwen3.5
 inference engine with a hand-written Metal GPU forward pass. Enable it via
-the `lattice` feature — macOS only today, since the dependency and the
-backend module are both target-gated (`cfg(target_os = "macos")`), so
-`--all-features` builds on other platforms are unaffected:
+the `lattice` feature (macOS only today: the dependency and the backend
+module are both target-gated with `cfg(target_os = "macos")`, so
+`--all-features` builds on other platforms are unaffected):
 
 ```rust,ignore
 use ruvllm::{LatticeBackend, ModelConfig, GenerateParams, LlmBackend};
@@ -196,7 +196,7 @@ let response = backend.generate("Hello, world!", params)?;
 `generate_stream_v2` streams every decoded token in real time via the real
 autoregressive decode loop (unlike the candle backend's `generate_stream_v2`,
 which samples exactly one token from the initial prefill logits then sends
-`Done`). `get_embeddings` returns `RuvLLMError::NotImplemented` today — lattice
+`Done`). `get_embeddings` returns `RuvLLMError::NotImplemented` today; lattice
 does not yet expose hidden-state pooling through this seam.
 
 ## Architecture

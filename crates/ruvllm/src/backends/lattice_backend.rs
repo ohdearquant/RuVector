@@ -1,7 +1,7 @@
 //! Lattice-based LLM inference backend
 //!
 //! This module provides a pluggable [`LlmBackend`] on top of
-//! [`lattice-inference`](https://crates.io/crates/lattice-inference) — a
+//! [`lattice-inference`](https://crates.io/crates/lattice-inference), a
 //! pure-Rust Qwen3.5 inference engine with a hand-written Metal GPU forward
 //! pass. macOS-only today: `lattice-inference`'s Metal path FFI-binds
 //! `metal`/`objc`, which don't exist off Apple platforms, so both the
@@ -13,7 +13,7 @@
 //!
 //! `lattice_inference::forward::metal_qwen35::MetalQwen35State` owns raw
 //! `metal::*` objects and is `!Send`, so it lives on one dedicated worker
-//! thread for the lifetime of the loaded model — the same shape
+//! thread for the lifetime of the loaded model: the same shape
 //! `lattice_serve.rs` (lattice's own OpenAI-compatible server binary) already
 //! uses for the identical problem, just riding plain `std::sync::mpsc`
 //! instead of tokio's, since ruvllm's [`TokenStream`](super::TokenStream) is
@@ -49,7 +49,7 @@ use lattice_inference::model::qwen35::Qwen35Model;
 use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 // Brought into scope for method-resolution only (`.tokenize()`/`.decode()` on
-// `BpeTokenizer` are trait-provided, not inherent) — aliased because ruvllm
+// `BpeTokenizer` are trait-provided, not inherent), aliased because ruvllm
 // already has its own `Tokenizer` trait (`super::Tokenizer`) in this file.
 use lattice_inference::tokenizer::Tokenizer as LatticeTokenizerTrait;
 
@@ -88,9 +88,14 @@ struct WorkerReady {
 
 /// Map ruvllm's `GenerateParams` onto lattice's `GenerateConfig`.
 ///
-/// `frequency_penalty`/`presence_penalty` are dead fields on `GenerateParams`
-/// (never read anywhere in ruvllm — confirmed by grep across the crate), so
-/// they are intentionally dropped here rather than mapped onto anything.
+/// `frequency_penalty`/`presence_penalty` have no lattice equivalent
+/// (lattice's sampler exposes `repetition_penalty` only), so nonzero values
+/// are rejected up front in `generate`/`generate_stream_v2` rather than
+/// silently ignored here; see [`reject_unsupported_params`].
+///
+/// `stop_strings` is mapped for forward compatibility, but lattice's Metal
+/// generation loops only honor EOS/`stop_token_ids` today, so the backend
+/// additionally enforces string stops itself via [`StopScan`].
 fn to_generate_config(params: &GenerateParams) -> GenerateConfig {
     GenerateConfig {
         max_new_tokens: params.max_tokens,
@@ -101,6 +106,90 @@ fn to_generate_config(params: &GenerateParams) -> GenerateConfig {
         seed: params.seed,
         stop_strings: params.stop_sequences.clone(),
         ..GenerateConfig::default()
+    }
+}
+
+/// Reject `GenerateParams` values this backend cannot honor, instead of
+/// silently changing public API behavior (the serving engine and the mistral
+/// backend both treat these penalties as live: serving/engine.rs:547,
+/// mistral_backend.rs:907).
+fn reject_unsupported_params(params: &GenerateParams) -> Result<()> {
+    if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
+        return Err(RuvLLMError::NotImplemented(
+            "LatticeBackend does not support frequency_penalty/presence_penalty \
+             (lattice's sampler exposes repetition_penalty only); set them to 0.0"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Incremental stop-string scanner over streamed deltas.
+///
+/// lattice's Metal generation loops stop on EOS/`stop_token_ids` but do not
+/// read `GenerateConfig::stop_strings` today (the field is honored on the CPU
+/// path only), so the backend enforces string stops here: scan the
+/// accumulated text, hold back the longest possible stop-string prefix so a
+/// partial match never leaks to the caller, and cut generation through the
+/// token callback's `false` return as soon as a stop matches. The matched
+/// stop string itself is excluded from the output, matching
+/// `GenerateConfig::stop_strings`' documented CPU-path semantics.
+struct StopScan {
+    stops: Vec<String>,
+    /// Bytes to hold back: the longest stop is `hold + 1` bytes long, so any
+    /// suffix that could still grow into a match stays in `buf`.
+    hold: usize,
+    buf: String,
+    stopped: bool,
+}
+
+impl StopScan {
+    /// Returns `None` when there is nothing to scan for (no non-empty stops),
+    /// letting callers skip the buffering entirely.
+    fn new(stops: &[String]) -> Option<Self> {
+        let stops: Vec<String> = stops.iter().filter(|s| !s.is_empty()).cloned().collect();
+        let hold = stops.iter().map(|s| s.len()).max()?.saturating_sub(1);
+        Some(Self {
+            stops,
+            hold,
+            buf: String::new(),
+            stopped: false,
+        })
+    }
+
+    /// Feed one delta; returns the text that is now safe to emit. Sets
+    /// `self.stopped` (and drops the match plus everything after it) when a
+    /// stop string is found.
+    fn push(&mut self, delta: &str) -> String {
+        self.buf.push_str(delta);
+        if let Some(pos) = self
+            .stops
+            .iter()
+            .filter_map(|s| self.buf.find(s.as_str()))
+            .min()
+        {
+            self.stopped = true;
+            let head = self.buf[..pos].to_string();
+            self.buf.clear();
+            return head;
+        }
+        if self.buf.len() <= self.hold {
+            return String::new();
+        }
+        // Emit all but the trailing `hold` bytes, snapped down to a char
+        // boundary so multi-byte codepoints are never split.
+        let mut split = self.buf.len() - self.hold;
+        while !self.buf.is_char_boundary(split) {
+            split -= 1;
+        }
+        let head = self.buf[..split].to_string();
+        self.buf.drain(..split);
+        head
+    }
+
+    /// Generation ended without a stop match: release the held-back tail.
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.buf)
     }
 }
 
@@ -151,7 +240,7 @@ fn load_worker_state(
     let cfg = Qwen35Config::from_config_json(config_path)
         .map_err(|e| format!("config.json parse failed: {e}"))?;
     // Honor the caller's `max_sequence_length` (ModelConfig) as the KV-cache
-    // window, clamped to what the RoPE table actually supports — exceeding
+    // window, clamped to what the RoPE table actually supports; exceeding
     // `max_position_embeddings` is refused inside `from_q4_dir`/`new_session`
     // anyway, so clamp here for a clean error message instead of a load failure.
     let max_cache_len = max_seq_len_hint.min(cfg.max_position_embeddings).max(1);
@@ -175,7 +264,7 @@ fn load_worker_state(
     // No live parameter count is available from `Qwen35Config` alone (Qwen3.5
     // mixes GDN/full-attention/MoE layers, so a generic per-layer formula like
     // candle_backend.rs's `estimate_parameters` would be architecture-wrong
-    // here) — derive it instead from what we already measured: on-disk bytes
+    // here); derive it instead from what we already measured: on-disk bytes
     // divided by the known bytes-per-weight for the quant format we just loaded.
     let num_parameters = (memory_usage as f32 / quant.bytes_per_weight()) as usize;
 
@@ -198,7 +287,7 @@ fn load_worker_state(
 /// the lifetime of the loaded model. Reuses `lattice_serve.rs`'s worker shape
 /// (module doc :29-32, `spawn_worker` :244, `run_worker_loop` :289): the
 /// non-`Send` state never crosses a thread boundary, only `Job`s (plain data)
-/// do. Jobs are served one at a time — matches serve, and Metal is
+/// do. Jobs are served one at a time, matching serve, and Metal is
 /// single-context anyway; concurrent `&self` calls simply queue on the channel.
 fn spawn_worker(
     model_dir: PathBuf,
@@ -252,26 +341,78 @@ fn spawn_worker(
             let cfg = to_generate_config(&job.params);
             match job.reply {
                 Reply::Once(tx) => {
-                    let out = metal.generate(&job.prompt, &tokenizer, &cfg);
-                    let _ = tx.send(Ok(out.text));
+                    let text = match StopScan::new(&cfg.stop_strings) {
+                        // No stop strings: the plain accumulate-everything path.
+                        None => metal.generate(&job.prompt, &tokenizer, &cfg).text,
+                        // Stop strings requested: drive the streaming loop so a
+                        // match actually HALTS generation (StopScan doc above),
+                        // instead of truncating after a full max_tokens run.
+                        Some(mut scan) => {
+                            let mut text = String::new();
+                            metal.generate_streaming_with_cancel(
+                                &job.prompt,
+                                &tokenizer,
+                                &cfg,
+                                |delta, _id| {
+                                    text.push_str(&scan.push(delta));
+                                    !scan.stopped
+                                },
+                                || false,
+                            );
+                            if !scan.stopped {
+                                text.push_str(&scan.finish());
+                            }
+                            text
+                        }
+                    };
+                    let _ = tx.send(Ok(text));
                 }
                 Reply::Stream(tx) => {
                     let start = Instant::now();
+                    let mut scan = StopScan::new(&cfg.stop_strings);
+                    // With a StopScan active, emitted text lags the decode by
+                    // up to `hold` bytes, so each emitted chunk carries the id
+                    // of the token whose delta released it (approximate but
+                    // monotone); the flushed tail reuses the last seen id.
+                    let mut last_id = 0u32;
                     let out = metal.generate_streaming_with_cancel(
                         &job.prompt,
                         &tokenizer,
                         &cfg,
                         |delta, id| {
-                            tx.send(StreamEvent::Token(GeneratedToken {
-                                id,
-                                text: delta.to_string(),
-                                logprob: None,
-                                is_special: special_ids.contains(&id),
-                            }))
-                            .is_ok()
+                            last_id = id;
+                            let (text, keep_going) = match scan.as_mut() {
+                                None => (delta.to_string(), true),
+                                Some(s) => (s.push(delta), !s.stopped),
+                            };
+                            let send_ok = if text.is_empty() {
+                                true
+                            } else {
+                                tx.send(StreamEvent::Token(GeneratedToken {
+                                    id,
+                                    text,
+                                    logprob: None,
+                                    is_special: special_ids.contains(&id),
+                                }))
+                                .is_ok()
+                            };
+                            keep_going && send_ok
                         },
                         || false,
                     );
+                    if let Some(s) = scan.as_mut() {
+                        if !s.stopped {
+                            let tail = s.finish();
+                            if !tail.is_empty() {
+                                let _ = tx.send(StreamEvent::Token(GeneratedToken {
+                                    id: last_id,
+                                    text: tail,
+                                    logprob: None,
+                                    is_special: special_ids.contains(&last_id),
+                                }));
+                            }
+                        }
+                    }
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let tokens_per_second = if duration_ms > 0 {
                         out.generated_tokens as f64 / (duration_ms as f64 / 1000.0)
@@ -290,7 +431,7 @@ fn spawn_worker(
     job_tx
 }
 
-/// Wraps a lattice `BpeTokenizer` (cheaply `Clone` — `Arc`-backed internally)
+/// Wraps a lattice `BpeTokenizer` (cheaply `Clone`, `Arc`-backed internally)
 /// behind ruvllm's [`Tokenizer`] trait object.
 pub struct LatticeTok {
     inner: BpeTokenizer,
@@ -324,7 +465,7 @@ impl Tokenizer for LatticeTok {
 /// See the module docs for the concurrency model and a usage example.
 pub struct LatticeBackend {
     /// `None` until `load_model` succeeds. The `Sender` is `Send + Sync` even
-    /// though the `!Send` `MetalQwen35State` it feeds jobs to is not — the
+    /// though the `!Send` `MetalQwen35State` it feeds jobs to is not; the
     /// state itself never leaves the dedicated worker thread.
     jobs: Option<mpsc::Sender<Job>>,
     info: Option<ModelInfo>,
@@ -430,6 +571,7 @@ impl LlmBackend for LatticeBackend {
     }
 
     fn generate(&self, prompt: &str, params: GenerateParams) -> Result<String> {
+        reject_unsupported_params(&params)?;
         let jobs = self
             .jobs
             .as_ref()
@@ -463,6 +605,7 @@ impl LlmBackend for LatticeBackend {
     }
 
     fn generate_stream_v2(&self, prompt: &str, params: GenerateParams) -> Result<TokenStream> {
+        reject_unsupported_params(&params)?;
         let jobs = self
             .jobs
             .as_ref()
@@ -510,5 +653,91 @@ impl LlmBackend for LatticeBackend {
         self.info = None;
         self.tok = None;
         self.model_id.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(stops: &[&str]) -> StopScan {
+        StopScan::new(&stops.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .expect("non-empty stops")
+    }
+
+    #[test]
+    fn stop_scan_none_when_no_stops() {
+        assert!(StopScan::new(&[]).is_none());
+        assert!(StopScan::new(&[String::new()]).is_none());
+    }
+
+    #[test]
+    fn stop_scan_cuts_at_stop_and_excludes_it() {
+        let mut s = scan(&["</s>"]);
+        let mut out = String::new();
+        for delta in ["hello ", "world</s", ">ignored"] {
+            out.push_str(&s.push(delta));
+            if s.stopped {
+                break;
+            }
+        }
+        assert!(s.stopped);
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn stop_scan_holds_back_partial_prefix() {
+        let mut s = scan(&["STOP"]);
+        // hold = 3 bytes: the trailing 3 bytes always stay buffered, since
+        // they could still grow into "STOP".
+        assert_eq!(s.push("abST"), "a"); // "bST" retained
+        assert!(!s.stopped);
+        assert_eq!(s.push("x"), "b"); // "STx" retained
+        // It never completes; finish() releases the held-back tail.
+        assert_eq!(s.finish(), "STx");
+        assert!(!s.stopped);
+    }
+
+    #[test]
+    fn stop_scan_earliest_of_multiple_stops_wins() {
+        let mut s = scan(&["<end>", "!!"]);
+        let out = s.push("abc!!def<end>");
+        assert!(s.stopped);
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn stop_scan_utf8_boundary_safe() {
+        let mut s = scan(&["<stop>"]); // hold = 5 bytes
+        let mut out = String::new();
+        // Multi-byte CJK codepoints (3 bytes each) forced through the
+        // hold-back split: the boundary snap must never panic mid-codepoint.
+        for delta in ["你好世界", "又一段文字"] {
+            out.push_str(&s.push(delta));
+        }
+        out.push_str(&s.finish());
+        assert!(!s.stopped);
+        assert_eq!(out, "你好世界又一段文字");
+    }
+
+    #[test]
+    fn nonzero_penalties_rejected_not_ignored() {
+        let backend = LatticeBackend::default();
+        let params = GenerateParams {
+            frequency_penalty: 0.1,
+            ..GenerateParams::default()
+        };
+        assert!(matches!(
+            backend.generate("x", params),
+            Err(RuvLLMError::NotImplemented(_))
+        ));
+        let params = GenerateParams {
+            presence_penalty: 0.1,
+            ..GenerateParams::default()
+        };
+        assert!(matches!(
+            backend.generate_stream_v2("x", params),
+            Err(RuvLLMError::NotImplemented(_))
+        ));
     }
 }
