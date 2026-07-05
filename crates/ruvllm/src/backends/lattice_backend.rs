@@ -210,6 +210,30 @@ fn sum_file_sizes(dir: &Path, ext: &str) -> usize {
     total
 }
 
+/// Derive the `ModelInfo` precision label for a safetensors checkpoint from
+/// its own config.json `torch_dtype`, mirroring lattice_bench.rs's honesty
+/// guard (O3: the label must match the actual artifact) instead of
+/// hard-coding `Bf16`. Falls back to `Bf16` — the Qwen3.5 release dtype and
+/// this backend's previous fixed label — when the field is missing or names
+/// a dtype we don't map; a label fallback must not fail a load that
+/// `from_safetensors` already accepted.
+fn safetensors_precision_label(config_path: &Path) -> Quantization {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("torch_dtype")
+                .and_then(|d| d.as_str())
+                .map(|d| d.to_string())
+        })
+        .map(|dtype| match dtype.as_str() {
+            "float16" => Quantization::F16,
+            "float32" => Quantization::None,
+            _ => Quantization::Bf16,
+        })
+        .unwrap_or(Quantization::Bf16)
+}
+
 /// Probe well-known Qwen special-token strings, mirroring candle_backend.rs's
 /// own probing approach for its `SpecialTokens` (candle_backend.rs:530-547).
 fn probe_special_tokens(tok: &BpeTokenizer) -> SpecialTokens {
@@ -256,7 +280,7 @@ fn load_worker_state(
             .map_err(|e| format!("Metal init failed: {e}"))?;
         (
             metal,
-            Quantization::Bf16,
+            safetensors_precision_label(config_path),
             sum_file_sizes(model_dir, "safetensors"),
         )
     };
@@ -679,6 +703,33 @@ mod tests {
     fn scan(stops: &[&str]) -> StopScan {
         StopScan::new(&stops.iter().map(|s| s.to_string()).collect::<Vec<_>>())
             .expect("non-empty stops")
+    }
+
+    #[test]
+    fn safetensors_precision_label_follows_torch_dtype() {
+        let dir = std::env::temp_dir().join(format!(
+            "lattice-dtype-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        for (dtype, expected) in [
+            ("bfloat16", Quantization::Bf16),
+            ("float16", Quantization::F16),
+            ("float32", Quantization::None),
+            ("int8", Quantization::Bf16), // unmapped → fallback, not a failure
+        ] {
+            std::fs::write(&cfg, format!("{{\"torch_dtype\": \"{dtype}\"}}")).unwrap();
+            assert_eq!(safetensors_precision_label(&cfg), expected, "dtype {dtype}");
+        }
+        // Missing field and unreadable path both fall back to Bf16.
+        std::fs::write(&cfg, "{}").unwrap();
+        assert_eq!(safetensors_precision_label(&cfg), Quantization::Bf16);
+        assert_eq!(
+            safetensors_precision_label(&dir.join("nope.json")),
+            Quantization::Bf16
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
