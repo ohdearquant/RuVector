@@ -6,6 +6,7 @@
 //!
 //! - **HashEmbedding**: Fast hash-based placeholder (default, not semantic)
 //! - **OnnxEmbedding**: Real semantic embeddings using ONNX Runtime (feature: `onnx-embeddings`) ✅ RECOMMENDED
+//! - **LatticeEmbedding**: Real semantic embeddings using lattice-embed, pure-Rust native inference (feature: `lattice-embeddings`)
 //! - **CandleEmbedding**: Real embeddings using candle-transformers (feature: `real-embeddings`)
 //! - **ApiEmbedding**: External API calls (OpenAI, Anthropic, Cohere, etc.)
 //!
@@ -33,7 +34,11 @@
 //! ```
 
 use crate::error::Result;
-#[cfg(any(feature = "real-embeddings", feature = "api-embeddings"))]
+#[cfg(any(
+    feature = "real-embeddings",
+    feature = "api-embeddings",
+    feature = "lattice-embeddings"
+))]
 use crate::error::RuvectorError;
 use std::sync::Arc;
 
@@ -718,6 +723,203 @@ pub mod onnx {
 #[cfg(feature = "onnx-embeddings")]
 pub use onnx::OnnxEmbedding;
 
+// ============================================================================
+// Lattice Embeddings (pure-Rust, native, no C++ FFI / no ONNX Runtime)
+// ============================================================================
+
+/// Native embedding provider backed by [`lattice-embed`](https://crates.io/crates/lattice-embed),
+/// a pure-Rust transformer inference engine (SIMD matmul, safetensors weight
+/// loading, no ONNX Runtime, no C++ FFI).
+///
+/// Requires feature flag: `lattice-embeddings`
+///
+/// ## Supported models
+/// - `bge-small-en-v1.5` / `BAAI/bge-small-en-v1.5` (384 dims, default, recommended for `.rvf` packs)
+/// - `bge-base-en-v1.5` / `BAAI/bge-base-en-v1.5` (768 dims)
+/// - `bge-large-en-v1.5` / `BAAI/bge-large-en-v1.5` (1024 dims)
+/// - `multilingual-e5-small` / `intfloat/multilingual-e5-small` (384 dims)
+/// - `multilingual-e5-base` / `intfloat/multilingual-e5-base` (768 dims)
+/// - `all-minilm-l6-v2` / `sentence-transformers/all-MiniLM-L6-v2` (384 dims)
+/// - `paraphrase-multilingual-minilm-l12-v2` / `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 dims)
+/// - `qwen3-embedding-0.6b` / `Qwen/Qwen3-Embedding-0.6B` (1024 dims)
+/// - `qwen3-embedding-4b` / `Qwen/Qwen3-Embedding-4B` (2560 dims)
+///
+/// Model-id parsing is delegated to `lattice_embed::EmbeddingModel`'s own
+/// `FromStr` impl (case-insensitive, accepts display names, short names, and
+/// HuggingFace ids) rather than re-implementing the mapping here, so this
+/// provider stays in sync with lattice-embed's canonical model table.
+///
+/// ## CPU / native, no GPU
+/// This provider uses lattice-embed's default `native` feature (CPU-only,
+/// SIMD-accelerated). It does **not** enable lattice-embed's `metal-gpu`
+/// feature.
+///
+/// ## Model download
+/// BERT-family models (BGE, E5, MiniLM) download automatically from
+/// HuggingFace into `~/.lattice/models` on first use. Qwen3-Embedding models
+/// must be placed at `~/.lattice/models/qwen3-embedding-{0.6b,4b}/` manually
+/// (or pointed to via `LATTICE_QWEN_MODEL_DIR`) before first use.
+///
+/// ## Asymmetric retrieval (query vs. passage prefixing)
+/// Some models (E5, Qwen3-Embedding) were trained with different prompt
+/// prefixes for queries vs. documents. [`EmbeddingProvider::embed`] always
+/// takes the **passage/document** side (no query instruction) via
+/// `lattice_embed::EmbeddingService::embed_passage`. Use the inherent
+/// [`LatticeEmbedding::embed_query`] method for query text — it applies the
+/// model's query instruction (e.g. E5's `"query: "` prefix, Qwen3's search
+/// instruction) via `EmbeddingService::embed_query`. BGE/MiniLM have no
+/// prefixes, so both methods are equivalent for those models.
+///
+/// # Example
+/// ```rust,no_run
+/// use ruvector_core::embeddings::{EmbeddingProvider, LatticeEmbedding};
+///
+/// let provider = LatticeEmbedding::from_pretrained("bge-small-en-v1.5")?;
+///
+/// // Document side: no query instruction.
+/// let doc_embedding = provider.embed("The cat sat on the mat.")?;
+/// assert_eq!(doc_embedding.len(), 384);
+///
+/// // Query side: applies the model's query instruction, if any.
+/// let query_embedding = provider.embed_query("Where did the cat sit?")?;
+/// assert_eq!(query_embedding.len(), 384);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[cfg(feature = "lattice-embeddings")]
+pub mod lattice_native {
+    use super::*;
+    use lattice_embed::{
+        EmbeddingModel as LatticeEmbeddingModel, EmbeddingService, NativeEmbeddingService,
+    };
+
+    /// See the [module-level docs](self) for the full provider description.
+    pub struct LatticeEmbedding {
+        service: NativeEmbeddingService,
+        model: LatticeEmbeddingModel,
+        model_id: &'static str,
+        // NOTE/SAFETY: this runtime exists solely to bridge lattice-embed's
+        // `async fn embed(...)` onto the sync `EmbeddingProvider` trait via
+        // `Runtime::block_on`. `block_on` PANICS if called from within an
+        // already-running Tokio runtime (e.g. from inside an `async fn` on
+        // another runtime). `EmbeddingProvider::embed` is a sync trait and
+        // ruvector-core callers are sync, so this is safe for v0 usage.
+        // Do NOT call `LatticeEmbedding::embed` / `embed_query` from inside
+        // an async task running on another Tokio runtime.
+        runtime: tokio::runtime::Runtime,
+    }
+
+    impl LatticeEmbedding {
+        /// Load a pre-trained embedding model by id.
+        ///
+        /// Accepts display names (`"bge-small-en-v1.5"`), short names
+        /// (`"bge-small"`, `"small"`), and HuggingFace ids
+        /// (`"BAAI/bge-small-en-v1.5"`) — see [`lattice_embed::EmbeddingModel`]'s
+        /// `FromStr` impl for the full accepted set. Returns an error for any
+        /// unrecognized id.
+        ///
+        /// # Example
+        /// ```rust,no_run
+        /// use ruvector_core::embeddings::LatticeEmbedding;
+        ///
+        /// let provider = LatticeEmbedding::from_pretrained("bge-small-en-v1.5")?;
+        /// # Ok::<(), Box<dyn std::error::Error>>(())
+        /// ```
+        pub fn from_pretrained(model_id: &str) -> Result<Self> {
+            let model: LatticeEmbeddingModel = model_id.parse().map_err(|e: String| {
+                RuvectorError::ModelLoadError(format!(
+                    "unknown lattice-embed model id '{model_id}': {e}"
+                ))
+            })?;
+            Self::with_model(model)
+        }
+
+        /// Load a pre-trained embedding model from an already-resolved
+        /// [`lattice_embed::EmbeddingModel`] variant.
+        pub fn with_model(model: LatticeEmbeddingModel) -> Result<Self> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    RuvectorError::ModelLoadError(format!(
+                        "failed to build tokio runtime for LatticeEmbedding: {e}"
+                    ))
+                })?;
+
+            Ok(Self {
+                service: NativeEmbeddingService::with_model(model),
+                model,
+                model_id: model.model_id(),
+                runtime,
+            })
+        }
+
+        /// Get the dimensionality of embeddings produced by the loaded model.
+        pub fn dimensions(&self) -> usize {
+            self.model.dimensions()
+        }
+
+        /// Embed **query** text, applying the model's query-side prompt
+        /// instruction if it uses one (E5's `"query: "` prefix, Qwen3's
+        /// search-query instruction). BGE/MiniLM have no query prefix, so
+        /// this is equivalent to [`EmbeddingProvider::embed`] for those
+        /// models.
+        ///
+        /// This is what makes asymmetric retrieval correct: index documents
+        /// via [`EmbeddingProvider::embed`] (passage side, no prefix) and
+        /// embed the search query via this method (query side, prefixed).
+        pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            self.runtime
+                .block_on(self.service.embed_query(&[text.to_string()], self.model))
+                .map_err(|e| {
+                    RuvectorError::ModelInferenceError(format!(
+                        "lattice-embed query embedding failed: {e}"
+                    ))
+                })?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    RuvectorError::ModelInferenceError(
+                        "lattice-embed returned no embedding".to_string(),
+                    )
+                })
+        }
+    }
+
+    impl EmbeddingProvider for LatticeEmbedding {
+        /// Embed **passage/document** text (no query instruction applied).
+        ///
+        /// Use [`LatticeEmbedding::embed_query`] for the query side of
+        /// asymmetric retrieval.
+        fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            self.runtime
+                .block_on(self.service.embed_passage(&[text.to_string()], self.model))
+                .map_err(|e| {
+                    RuvectorError::ModelInferenceError(format!(
+                        "lattice-embed passage embedding failed: {e}"
+                    ))
+                })?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    RuvectorError::ModelInferenceError(
+                        "lattice-embed returned no embedding".to_string(),
+                    )
+                })
+        }
+
+        fn dimensions(&self) -> usize {
+            self.model.dimensions()
+        }
+
+        fn name(&self) -> &str {
+            self.model_id
+        }
+    }
+}
+
+#[cfg(feature = "lattice-embeddings")]
+pub use lattice_native::LatticeEmbedding;
+
 /// Type-erased embedding provider for dynamic dispatch
 pub type BoxedEmbeddingProvider = Arc<dyn EmbeddingProvider>;
 
@@ -837,6 +1039,65 @@ mod tests {
             for emb in &embeddings {
                 assert_eq!(emb.len(), 384);
             }
+        }
+    }
+
+    #[cfg(feature = "lattice-embeddings")]
+    mod lattice_tests {
+        use super::*;
+        use crate::embeddings::LatticeEmbedding;
+
+        /// Pure model-id mapping test — no network, no model load.
+        /// `LatticeEmbedding::from_pretrained` delegates to
+        /// `lattice_embed::EmbeddingModel::from_str`; this test locks in that
+        /// bge-small resolves from both its display name and its HuggingFace
+        /// id, and that an unrecognized id errors instead of silently
+        /// defaulting.
+        #[test]
+        fn test_lattice_from_pretrained_model_id_mapping() {
+            let by_display_name = LatticeEmbedding::from_pretrained("bge-small-en-v1.5").unwrap();
+            assert_eq!(by_display_name.dimensions(), 384);
+            assert_eq!(EmbeddingProvider::dimensions(&by_display_name), 384);
+
+            let by_hf_id = LatticeEmbedding::from_pretrained("BAAI/bge-small-en-v1.5").unwrap();
+            assert_eq!(by_hf_id.dimensions(), 384);
+
+            let unknown = LatticeEmbedding::from_pretrained("not-a-real-model");
+            assert!(
+                unknown.is_err(),
+                "unknown model id should error, not default"
+            );
+        }
+
+        #[test]
+        fn test_lattice_from_pretrained_minilm_mapping() {
+            let by_short = LatticeEmbedding::from_pretrained("all-minilm-l6-v2").unwrap();
+            assert_eq!(by_short.dimensions(), 384);
+
+            let by_hf_id =
+                LatticeEmbedding::from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+                    .unwrap();
+            assert_eq!(by_hf_id.dimensions(), 384);
+        }
+
+        /// Real end-to-end embedding test. Requires the bge-small-en-v1.5
+        /// model to be downloaded from HuggingFace on first use (~130MB) —
+        /// network access, not run in CI. Run manually with:
+        ///   cargo test -p ruvector-core --features lattice-embeddings -- --ignored lattice_tests
+        #[test]
+        #[ignore]
+        fn test_lattice_embedding_real() {
+            let provider = LatticeEmbedding::from_pretrained("bge-small-en-v1.5").unwrap();
+
+            let embedding = provider.embed("hello world").unwrap();
+            assert_eq!(embedding.len(), 384);
+            assert!(embedding.iter().all(|v| v.is_finite()));
+
+            let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-3,
+                "embedding should be L2-normalized, got norm={norm}"
+            );
         }
     }
 }

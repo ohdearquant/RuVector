@@ -55,6 +55,10 @@ tokenizers = { version = "0.20", default-features = false, features = ["onig"], 
 # HuggingFace Hub for model downloads
 hf-hub = { version = "0.4", optional = true }
 
+# Native (pure-Rust) local embeddings via lattice-embed (not available in WASM)
+lattice-embed = { version = "0.5", optional = true }
+tokio = { workspace = true, optional = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
@@ -110,6 +114,7 @@ uuid-support = []  # Deprecated: uuid is now always included
 real-embeddings = []  # Feature flag for embedding provider API (use ApiEmbedding for production)
 api-embeddings = ["reqwest"]  # API-based embeddings (not available in WASM)
 onnx-embeddings = ["ort", "tokenizers", "hf-hub"]  # ONNX-based local embeddings (not available in WASM)
+lattice-embeddings = ["dep:lattice-embed", "dep:tokio"]  # Native pure-Rust local embeddings via lattice-embed (not available in WASM)
 
 [lib]
 crate-type = ["rlib"]
