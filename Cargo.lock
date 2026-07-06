@@ -4927,9 +4927,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-embed"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f070c06e328d4b2e40d661ef7c70f97e2f0b8429956f7bc43369072c280b574"
+checksum = "81c40a349ed412ca8a4b89ad4f0c19cca28e9de969a570bada665e6df195d745"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4946,9 +4946,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a20a15b5b61cad786a707085e30ba0ed424368bac234c63178d442677abcefa"
+checksum = "5cf759944705182b487cc3a1d99687fa518f031c8239857d351297c9cecabd42"
 dependencies = [
  "axum 0.8.9",
  "clap",
