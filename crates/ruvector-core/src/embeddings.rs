@@ -914,11 +914,14 @@ pub mod lattice_native {
                                 }
                             }
                         });
-                        let mapped = outcome.map_err(|e| e.to_string()).and_then(|mut embeddings| {
-                            embeddings
-                                .pop()
-                                .ok_or_else(|| "lattice-embed returned no embedding".to_string())
-                        });
+                        let mapped =
+                            outcome
+                                .map_err(|e| e.to_string())
+                                .and_then(|mut embeddings| {
+                                    embeddings.pop().ok_or_else(|| {
+                                        "lattice-embed returned no embedding".to_string()
+                                    })
+                                });
                         // Ignore send errors: they only occur if the caller
                         // already dropped its reply receiver.
                         let _ = request.reply_tx.send(mapped);
