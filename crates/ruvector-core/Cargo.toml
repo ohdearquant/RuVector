@@ -102,6 +102,12 @@ harness = false
 name = "bench_memory"
 harness = false
 
+# Feature-gated: only built when `lattice-embeddings` is enabled, since it uses
+# the LatticeEmbedding provider (which is behind that feature).
+[[example]]
+name = "lattice_embedding_example"
+required-features = ["lattice-embeddings"]
+
 [features]
 default = ["simd", "simd-avx512", "storage", "hnsw", "api-embeddings", "parallel"]
 simd = ["simsimd"]  # SIMD acceleration (not available in WASM)

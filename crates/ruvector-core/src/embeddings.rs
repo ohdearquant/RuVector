@@ -824,6 +824,27 @@ pub mod lattice_native {
 
     /// See the [module-level docs](self) for the full provider description.
     ///
+    /// # Examples
+    /// Embed a passage and a query on an asymmetric BGE model. The query is
+    /// embedded with [`embed_query`](LatticeEmbedding::embed_query), which
+    /// applies BGE's retrieval instruction, so it produces a different vector
+    /// than passing the same text through [`EmbeddingProvider::embed`] (the
+    /// passage side). Using `embed_query` for queries is what makes
+    /// query-to-passage retrieval scores correct on asymmetric models.
+    /// ```rust,no_run
+    /// use ruvector_core::embeddings::{EmbeddingProvider, LatticeEmbedding};
+    ///
+    /// let provider = LatticeEmbedding::from_pretrained("bge-small-en-v1.5")?;
+    ///
+    /// let passage = provider.embed("The Eiffel Tower is in Paris, France.")?;
+    /// let query = provider.embed_query("Where is the Eiffel Tower?")?;
+    /// assert_eq!(passage.len(), provider.dimensions());
+    /// assert_eq!(query.len(), provider.dimensions());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    /// A runnable version that prints the cosine similarities of the query and
+    /// passage vectors is in `examples/lattice_embedding_example.rs`.
+    ///
     /// # Threading model
     /// `lattice-embed`'s [`EmbeddingService`] is `async`-only (no sync/blocking
     /// API), but [`EmbeddingProvider::embed`] is a sync method that ruvector-core
