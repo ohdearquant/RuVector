@@ -36,13 +36,17 @@
   },
   "peerDependencies": {
     "openai": "^4.0.0",
-    "cohere-ai": "^7.0.0"
+    "cohere-ai": "^7.0.0",
+    "@khive-ai/lattice-embed-wasm": "^0.1.0"
   },
   "peerDependenciesMeta": {
     "openai": {
       "optional": true
     },
     "cohere-ai": {
+      "optional": true
+    },
+    "@khive-ai/lattice-embed-wasm": {
       "optional": true
     }
   },
