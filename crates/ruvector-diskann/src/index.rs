@@ -4,7 +4,7 @@ use crate::distance::{l2_squared, FlatVectors, VisitedSet};
 use crate::error::{DiskAnnError, Result};
 use crate::graph::VamanaGraph;
 use crate::pq::ProductQuantizer;
-use memmap2::{Mmap, MmapOptions};
+use memmap2::MmapOptions;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -72,8 +72,6 @@ pub struct DiskAnnIndex {
     built: bool,
     /// Reusable visited set for search (avoids per-query allocation)
     visited: Option<VisitedSet>,
-    /// Memory-mapped vector data (for large datasets)
-    mmap: Option<Mmap>,
 }
 
 impl DiskAnnIndex {
@@ -90,12 +88,16 @@ impl DiskAnnIndex {
             pq_codes: Vec::new(),
             built: false,
             visited: None,
-            mmap: None,
         }
     }
 
     /// Insert a vector with a string ID
     pub fn insert(&mut self, id: String, vector: Vec<f32>) -> Result<()> {
+        if self.vectors.is_mmap_backed() {
+            return Err(DiskAnnError::InvalidConfig(
+                "cannot insert into an mmap-loaded index (read-only, read-through storage); use DiskAnnIndex::load() instead of load_mmap() if further inserts are needed".to_string(),
+            ));
+        }
         if vector.len() != self.config.dim {
             return Err(DiskAnnError::DimensionMismatch {
                 expected: self.config.dim,
@@ -226,14 +228,21 @@ impl DiskAnnIndex {
         let dim = self.config.dim as u64;
         f.write_all(&n.to_le_bytes())?;
         f.write_all(&dim.to_le_bytes())?;
-        // Write flat slab directly — zero copy
-        let byte_slice = unsafe {
-            std::slice::from_raw_parts(
-                self.vectors.data.as_ptr() as *const u8,
-                self.vectors.data.len() * 4,
-            )
-        };
-        f.write_all(byte_slice)?;
+        if let Some(data) = self.vectors.as_owned_slice() {
+            // Owned storage: write the flat slab directly — zero copy.
+            let byte_slice =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+            f.write_all(byte_slice)?;
+        } else {
+            // Mmap-backed storage: no single contiguous owned buffer to cast, so
+            // re-serialize per vector instead (this also folds in any post-load
+            // tombstones as NaN rows, matching owned storage's on-disk encoding).
+            for i in 0..self.vectors.len() {
+                for &value in self.vectors.get(i) {
+                    f.write_all(&value.to_le_bytes())?;
+                }
+            }
+        }
         f.flush()?;
 
         // Save graph adjacency
@@ -293,8 +302,26 @@ impl DiskAnnIndex {
         Ok(())
     }
 
-    /// Load index from disk with memory-mapped vectors
+    /// Load index from disk with vectors fully materialized into RAM (default,
+    /// back-compat behavior — unchanged from prior releases).
     pub fn load(dir: &Path) -> Result<Self> {
+        Self::load_impl(dir, false)
+    }
+
+    /// Load index from disk with vectors served read-through from an mmap: the OS
+    /// pages in only accessed vectors, so RSS stays proportional to the query
+    /// working set instead of the full dataset. Graph adjacency, PQ codes, and IDs
+    /// are still heap-resident (small relative to the vector slab). See #674.
+    ///
+    /// Opt-in — `load()` remains the default and is unaffected. Further inserts on
+    /// the returned index fail with `DiskAnnError::InvalidConfig`; the read-through
+    /// map is not writable. Deletes still work identically to `load()` (see
+    /// [`FlatVectors::zero_out`]).
+    pub fn load_mmap(dir: &Path) -> Result<Self> {
+        Self::load_impl(dir, true)
+    }
+
+    fn load_impl(dir: &Path, mmap_vectors: bool) -> Result<Self> {
         // Load config
         let config_json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)
@@ -318,7 +345,9 @@ impl DiskAnnIndex {
             ..Default::default()
         };
 
-        // Load vectors via mmap
+        // Map the vectors file (needed either way to read the 16-byte header; in
+        // mmap mode the map is retained and read through, in owned mode it is
+        // copied out below and then dropped).
         let vec_file = File::open(dir.join("vectors.bin"))?;
         let mmap = unsafe { MmapOptions::new().map(&vec_file)? };
 
@@ -326,19 +355,20 @@ impl DiskAnnIndex {
         let file_dim = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
         assert_eq!(file_dim, dim);
 
-        // Load vectors directly into flat slab from mmap
         let data_start = 16;
-        let total_floats = n * dim;
-        let mut flat_data = Vec::with_capacity(total_floats);
-        let byte_slice = &mmap[data_start..data_start + total_floats * 4];
-        // Safe: f32 from le bytes
-        for chunk in byte_slice.chunks_exact(4) {
-            flat_data.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-        }
-        let vectors = FlatVectors {
-            data: flat_data,
-            dim,
-            count: n,
+        let vectors = if mmap_vectors {
+            FlatVectors::from_mmap(mmap, data_start, dim, n)?
+        } else {
+            // Copy the flat slab out of the map into an owned Vec — unchanged
+            // from the pre-#674 behavior.
+            let total_floats = n * dim;
+            let mut flat_data = Vec::with_capacity(total_floats);
+            let byte_slice = &mmap[data_start..data_start + total_floats * 4];
+            // Safe: f32 from le bytes
+            for chunk in byte_slice.chunks_exact(4) {
+                flat_data.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            FlatVectors::from_owned(flat_data, dim, n)
         };
 
         // Load IDs
@@ -408,7 +438,6 @@ impl DiskAnnIndex {
             pq_codes,
             built: true,
             visited: Some(VisitedSet::new(n)),
-            mmap: Some(mmap),
         })
     }
 }
@@ -509,6 +538,159 @@ mod tests {
         let loaded = DiskAnnIndex::load(&path).unwrap();
         let results = loaded.search(&query, 3).unwrap();
         assert_eq!(results[0].id, "vec-7");
+    }
+
+    #[test]
+    fn test_diskann_load_mmap_basic() {
+        // Same fixture as test_diskann_save_load, but exercised through the new
+        // read-through load_mmap() entry point (#674).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("diskann_mmap_test");
+
+        let data = random_vectors(100, 16);
+        let query = data[7].1.clone();
+
+        {
+            let mut index = DiskAnnIndex::new(DiskAnnConfig {
+                dim: 16,
+                max_degree: 8,
+                build_beam: 16,
+                search_beam: 16,
+                alpha: 1.2,
+                storage_path: Some(path.clone()),
+                ..Default::default()
+            });
+            index.insert_batch(data).unwrap();
+            index.build().unwrap();
+        }
+
+        let loaded = DiskAnnIndex::load_mmap(&path).unwrap();
+        assert!(loaded.vectors.is_mmap_backed());
+        let results = loaded.search(&query, 3).unwrap();
+        assert_eq!(results[0].id, "vec-7");
+        assert!(results[0].distance < 1e-6);
+    }
+
+    #[test]
+    fn test_load_and_load_mmap_return_identical_results() {
+        // Parity contract: both storage backends must be indistinguishable to
+        // callers for the same on-disk index — the core requirement of #674.
+        use rand::prelude::*;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("diskann_parity_test");
+        let data = random_vectors(300, 24);
+
+        {
+            let mut index = DiskAnnIndex::new(DiskAnnConfig {
+                dim: 24,
+                max_degree: 16,
+                build_beam: 32,
+                search_beam: 32,
+                alpha: 1.2,
+                storage_path: Some(path.clone()),
+                ..Default::default()
+            });
+            index.insert_batch(data.clone()).unwrap();
+            index.build().unwrap();
+        }
+
+        let owned = DiskAnnIndex::load(&path).unwrap();
+        let mmapped = DiskAnnIndex::load_mmap(&path).unwrap();
+        assert!(!owned.vectors.is_mmap_backed());
+        assert!(mmapped.vectors.is_mmap_backed());
+
+        let mut rng = StdRng::seed_from_u64(0xACED);
+        for _ in 0..20 {
+            let qi = rng.gen_range(0..data.len());
+            let query = &data[qi].1;
+            let owned_results: Vec<(String, f32)> = owned
+                .search(query, 5)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.distance))
+                .collect();
+            let mmap_results: Vec<(String, f32)> = mmapped
+                .search(query, 5)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.distance))
+                .collect();
+            assert_eq!(owned_results, mmap_results);
+        }
+    }
+
+    #[test]
+    fn test_delete_owned_zero_out_is_nan() {
+        let mut index = DiskAnnIndex::new(DiskAnnConfig {
+            dim: 4,
+            ..Default::default()
+        });
+        index.insert("a".to_string(), vec![1.0; 4]).unwrap();
+        index.insert("b".to_string(), vec![2.0; 4]).unwrap();
+        index.build().unwrap();
+
+        assert!(index.delete("a").unwrap());
+        assert!(index.vectors.get(0).iter().all(|x| x.is_nan()));
+        assert_eq!(index.vectors.get(1), &[2.0; 4]);
+    }
+
+    #[test]
+    fn test_load_mmap_delete_matches_owned_tombstone() {
+        // Delete/tombstone representation must be identical (externally: an
+        // all-NaN row) whether storage is Owned or mmap-backed.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("diskann_mmap_delete_test");
+        let data = random_vectors(50, 8);
+
+        {
+            let mut index = DiskAnnIndex::new(DiskAnnConfig {
+                dim: 8,
+                max_degree: 8,
+                build_beam: 16,
+                search_beam: 16,
+                alpha: 1.2,
+                storage_path: Some(path.clone()),
+                ..Default::default()
+            });
+            index.insert_batch(data).unwrap();
+            index.build().unwrap();
+        }
+
+        let mut loaded = DiskAnnIndex::load_mmap(&path).unwrap();
+        assert!(loaded.delete("vec-3").unwrap());
+        // "vec-3" was the 4th insert (0-indexed) — insert() assigns internal ids
+        // in insertion order, and random_vectors() preserves that same order.
+        assert!(loaded.vectors.get(3).iter().all(|x| x.is_nan()));
+        assert!(
+            !loaded.delete("vec-3").unwrap(),
+            "second delete of the same id must report not-found"
+        );
+    }
+
+    #[test]
+    fn test_insert_rejected_on_mmap_loaded_index() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("diskann_mmap_insert_reject_test");
+        let data = random_vectors(20, 4);
+
+        {
+            let mut index = DiskAnnIndex::new(DiskAnnConfig {
+                dim: 4,
+                max_degree: 4,
+                build_beam: 8,
+                search_beam: 8,
+                alpha: 1.2,
+                storage_path: Some(path.clone()),
+                ..Default::default()
+            });
+            index.insert_batch(data).unwrap();
+            index.build().unwrap();
+        }
+
+        let mut loaded = DiskAnnIndex::load_mmap(&path).unwrap();
+        let result = loaded.insert("new-vec".to_string(), vec![1.0; 4]);
+        assert!(result.is_err());
     }
 
     #[test]
