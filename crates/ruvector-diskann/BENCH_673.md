@@ -67,8 +67,59 @@ build):
 
 ### Results
 
-<!-- FILLED IN AFTER THE SWEEP RUN COMPLETES -->
+Run: `cargo test -p ruvector-diskann --release -- --ignored --nocapture
+bench_pq_tuning_sweep_100k` (harness in `src/index.rs`), 2026-07-12, Apple M2
+Max, machine-wide exclusive build/test lane for the M=16 build and all nine
+M=16 cells. One fresh M=16 build: **3734.2s**; all nine cells reuse it, plus
+the shared ground-truth (50 queries, seed `0xBEEF`) and latency pool (220
+queries, seed `0xFACEB00C`) per the pre-registration.
+
+| L | R | Recall@10 | Median | p95 | Gate |
+|---|---|---|---|---|---|
+| 64 | 10 | 0.322 | 155us | 462us | FAIL (recall) |
+| 64 | 30 | 0.526 | 154us | 458us | FAIL (recall) |
+| 64 | 100 | 0.676 | 166us | 1102us | FAIL (recall) |
+| 128 | 10 | 0.330 | 274us | 1962us | FAIL (recall) |
+| 128 | 30 | 0.520 | 309us | 2083us | FAIL (recall) |
+| 128 | 100 | 0.740 | 265us | 1353us | FAIL (recall) |
+| 256 | 10 | 0.330 | 512us | 1752us | FAIL (recall, median) |
+| 256 | 30 | 0.512 | 386us | 1022us | FAIL (recall) |
+| 256 | 100 | **0.756** | 488us | 2271us | FAIL (recall, median) |
+
+Best-by-recall cell: L=256 R=100 at 0.756 — within 0.05 of the 0.80 gate, so
+the pre-registered single M=32 escalation arm fired at that cell:
+
+| Arm | Build | Recall@10 | Median | p95 | Gate |
+|---|---|---|---|---|---|
+| M=32, L=256, R=100 | 2843.8s | **0.922** | 680us | 2676us | FAIL (median, p95) |
+
+Confound disclosure (M=32 arm only): the M=32 timed pass ran in a window with
+other build/upload jobs active on the machine after a mid-run widening of the
+build-lane policy; the M=16 cells ran quieter. This cannot rescue the verdict:
+the M=16 best cell already missed the 417us median gate at 488us under the
+quieter window, and M=32 strictly increases per-hop distance-table work (2x
+subquantizers), so no plausible decontended M=32 median lands under 417us.
+Recall is deterministic and unaffected by contention.
 
 ### Verdict
 
-<!-- FILLED IN AFTER THE SWEEP RUN COMPLETES -->
+**No cell clears the pre-registered gate (all three thresholds
+simultaneously). Final verdict per pre-registration: NO-OPEN.** No further
+tuning rounds.
+
+Two findings worth recording:
+
+1. **The latency failure is structural at dim=128.** PQ-guided traversal saves
+   exact-L2 work per hop but pays a distance-table lookup per neighbor; at
+   d=128 with M=16 the net win only materializes at recall-destroying beam
+   widths, and M=32 (needed for recall) doubles the table cost back to
+   exact-arm latency (680us vs 695us exact median).
+2. **M=32 PQ-guided + exact re-rank EXCEEDS the exact-traversal recall ceiling
+   at parity latency**: 0.922 vs 0.816 recall@10, 680us vs 695us median. The
+   PQ-steered frontier explores differently than the exact greedy walk and,
+   with a generous candidate pool (L=256) plus exact re-rank, surfaces more
+   true neighbors. As a *speed* feature (the #673 framing and this gate) the
+   wiring does not pay; as a *recall* feature at equal cost it beats the
+   baseline by +10.6pp. That repositioning — plus OPQ rotation, SIMD table
+   scans, or PQ admission only for frontier expansion — is what a revisit
+   would take.
