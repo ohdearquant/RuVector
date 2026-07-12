@@ -125,6 +125,21 @@ ignore = [
     # 2026-08-01.
     "RUSTSEC-2026-0105",
 
+    # ttf-parser — unmaintained, upstream author stated no further fixes
+    # will be released (RUSTSEC-2026-0192); the advisory itself states
+    # "No safe upgrade is available!". Reaches the graph at three
+    # independent versions, none of them fixable by a version bump:
+    #   0.15.2 via rusttype 0.9.3 -> owned_ttf_parser (dev-only, scipix)
+    #   0.20.0 via plotters 0.3.7 -> criterion (dev-dep, workspace-wide) and
+    #           -> ruvector-bench's own chart rendering (publish = false)
+    #   0.25.1 via imageproc 0.25.1 -> ab_glyph -> owned_ttf_parser (scipix)
+    # All three paths are dev-dependencies or unpublished bench-only tooling,
+    # never linked into a published/production artifact; font-parsing
+    # inputs are local example assets, not attacker-controlled. Re-review
+    # 2026-08-01 or when a maintained fork (e.g. skrifa) is adopted by
+    # rusttype/plotters/imageproc upstream.
+    "RUSTSEC-2026-0192",
+
     # memmap2 0.9.x — unsound `Unchecked pointer offset` API (RUSTSEC-2026-0186,
     # "unsound", not an exploitable vuln). Transitive via safetensors/candle
     # mmap loading and other crates; no fixed release on the 0.9 line yet.
