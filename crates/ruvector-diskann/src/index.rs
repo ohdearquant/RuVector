@@ -62,6 +62,10 @@ pub struct DiskAnnIndex {
     id_map: Vec<String>,
     /// Reverse mapping: external ID -> internal index
     id_reverse: HashMap<String, u32>,
+    /// Packed deletion markers. Tombstoned vectors remain available for routing.
+    tombstones: Vec<u64>,
+    /// Number of tombstoned vectors.
+    deleted_count: usize,
     /// Vamana graph
     graph: Option<VamanaGraph>,
     /// Product quantizer (optional)
@@ -85,6 +89,8 @@ impl DiskAnnIndex {
             vectors: FlatVectors::new(dim),
             id_map: Vec::new(),
             id_reverse: HashMap::new(),
+            tombstones: Vec::new(),
+            deleted_count: 0,
             graph: None,
             pq: None,
             pq_codes: Vec::new(),
@@ -109,6 +115,9 @@ impl DiskAnnIndex {
         let idx = self.vectors.len() as u32;
         self.id_reverse.insert(id.clone(), idx);
         self.id_map.push(id);
+        if idx as usize / 64 == self.tombstones.len() {
+            self.tombstones.push(0);
+        }
         self.vectors.push(&vector);
         self.built = false;
         Ok(())
@@ -152,6 +161,11 @@ impl DiskAnnIndex {
             self.config.alpha,
         );
         graph.build(&self.vectors)?;
+        for deleted in 0..n {
+            if self.is_tombstoned(deleted) {
+                graph.repair_deleted(&self.vectors, deleted as u32, &self.tombstones);
+            }
+        }
         self.graph = Some(graph);
 
         // Pre-allocate visited set for search
@@ -185,9 +199,10 @@ impl DiskAnnIndex {
         // Re-rank candidates with exact distance
         let mut scored: Vec<(u32, f32)> = candidates
             .into_iter()
+            .filter(|&id| !self.is_tombstoned(id as usize))
             .map(|id| (id, l2_squared(self.vectors.get(id as usize), query)))
             .collect();
-        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
 
         Ok(scored
             .into_iter()
@@ -201,18 +216,45 @@ impl DiskAnnIndex {
 
     /// Get the number of vectors in the index
     pub fn count(&self) -> usize {
-        self.vectors.len()
+        self.vectors.len() - self.deleted_count
     }
 
-    /// Delete a vector by ID (marks as deleted, doesn't rebuild graph)
+    /// Delete a vector by ID and locally repair its live in-neighbors.
+    ///
+    /// In-neighbor discovery scans the bounded-degree adjacency, making this
+    /// O(n * degree) per delete. Unknown and already-deleted IDs return an error.
     pub fn delete(&mut self, id: &str) -> Result<bool> {
-        if let Some(&idx) = self.id_reverse.get(id) {
-            self.vectors.zero_out(idx as usize);
-            self.id_reverse.remove(id);
-            Ok(true)
-        } else {
-            Ok(false)
+        let idx = self.mark_deleted(id)?;
+        if let Some(graph) = self.graph.as_mut() {
+            graph.repair_deleted(&self.vectors, idx, &self.tombstones);
         }
+        Ok(true)
+    }
+
+    /// Tombstone a vector without repairing graph edges.
+    ///
+    /// Searches may still traverse the preserved vector as a routing waypoint,
+    /// but the ID is filtered from results. Unknown and repeated deletes error.
+    pub fn delete_deferred(&mut self, id: &str) -> Result<bool> {
+        self.mark_deleted(id)?;
+        Ok(true)
+    }
+
+    fn mark_deleted(&mut self, id: &str) -> Result<u32> {
+        let idx = self
+            .id_reverse
+            .remove(id)
+            .ok_or_else(|| DiskAnnError::NotFound(id.to_string()))?;
+        let idx = idx as usize;
+        self.tombstones[idx / 64] |= 1u64 << (idx % 64);
+        self.deleted_count += 1;
+        Ok(idx as u32)
+    }
+
+    fn is_tombstoned(&self, idx: usize) -> bool {
+        self.tombstones
+            .get(idx / 64)
+            .is_some_and(|word| word & (1u64 << (idx % 64)) != 0)
     }
 
     /// Save index to disk
@@ -257,6 +299,15 @@ impl DiskAnnIndex {
             .map_err(|e| DiskAnnError::Serialization(e.to_string()))?;
         fs::write(&ids_path, ids_json)?;
 
+        // Persist tombstones independently so older indexes without this file
+        // remain loadable and are interpreted as having no deletions.
+        let tombstones: Vec<u8> = self
+            .tombstones
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        fs::write(dir.join("tombstones.bin"), tombstones)?;
+
         // Save PQ if present
         if let Some(ref pq) = self.pq {
             let pq_path = dir.join("pq.bin");
@@ -282,7 +333,8 @@ impl DiskAnnIndex {
             "search_beam": self.config.search_beam,
             "alpha": self.config.alpha,
             "pq_subspaces": self.config.pq_subspaces,
-            "count": self.vectors.len(),
+            "count": self.count(),
+            "vector_count": self.vectors.len(),
             "built": self.built,
         });
         fs::write(
@@ -346,9 +398,43 @@ impl DiskAnnIndex {
         let id_map: Vec<String> = serde_json::from_str(&ids_json)
             .map_err(|e| DiskAnnError::Serialization(e.to_string()))?;
 
+        let tombstone_path = dir.join("tombstones.bin");
+        let tombstones = if tombstone_path.exists() {
+            let bytes = fs::read(tombstone_path)?;
+            let word_count = n.div_ceil(64);
+            if bytes.len() != word_count * 8 {
+                return Err(DiskAnnError::Serialization(
+                    "invalid tombstone data".to_string(),
+                ));
+            }
+            let words: Vec<u64> = bytes
+                .chunks_exact(8)
+                .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            if n % 64 != 0
+                && words
+                    .last()
+                    .is_some_and(|word| word & !((1u64 << (n % 64)) - 1) != 0)
+            {
+                return Err(DiskAnnError::Serialization(
+                    "invalid tombstone data".to_string(),
+                ));
+            }
+            words
+        } else {
+            vec![0; n.div_ceil(64)]
+        };
+        let deleted_count = tombstones
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum();
+
         let mut id_reverse = HashMap::new();
         for (i, id) in id_map.iter().enumerate() {
-            id_reverse.insert(id.clone(), i as u32);
+            let is_tombstoned = tombstones[i / 64] & (1u64 << (i % 64)) != 0;
+            if !is_tombstoned {
+                id_reverse.insert(id.clone(), i as u32);
+            }
         }
 
         // Load graph
@@ -403,6 +489,8 @@ impl DiskAnnIndex {
             vectors,
             id_map,
             id_reverse,
+            tombstones,
+            deleted_count,
             graph: Some(graph),
             pq,
             pq_codes,
@@ -509,6 +597,191 @@ mod tests {
         let loaded = DiskAnnIndex::load(&path).unwrap();
         let results = loaded.search(&query, 3).unwrap();
         assert_eq!(results[0].id, "vec-7");
+    }
+
+    #[test]
+    fn test_delete_filters_exact_match_and_preserves_vector() {
+        let mut index = DiskAnnIndex::new(DiskAnnConfig {
+            dim: 16,
+            max_degree: 8,
+            build_beam: 24,
+            search_beam: 24,
+            ..Default::default()
+        });
+        let data = random_vectors(200, 16);
+        let query = data[42].1.clone();
+        index.insert_batch(data).unwrap();
+        index.build().unwrap();
+
+        let internal_id = index.id_reverse["vec-42"] as usize;
+        let before = index.vectors.get(internal_id).to_vec();
+        index.delete("vec-42").unwrap();
+
+        assert_eq!(index.vectors.get(internal_id), before);
+        let graph = index.graph.as_ref().unwrap();
+        assert!(graph.neighbors[internal_id].is_empty());
+        assert!(graph
+            .neighbors
+            .iter()
+            .all(|neighbors| !neighbors.contains(&(internal_id as u32))));
+        let first = index.search(&query, 10).unwrap();
+        let second = index.search(&query, 10).unwrap();
+        assert!(first.iter().all(|result| result.id != "vec-42"));
+        assert!(first.iter().all(|result| result.distance.is_finite()));
+        assert_eq!(
+            first
+                .iter()
+                .map(|result| (&result.id, result.distance.to_bits()))
+                .collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|result| (&result.id, result.distance.to_bits()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_delete_count_and_errors() {
+        let mut index = DiskAnnIndex::new(DiskAnnConfig {
+            dim: 4,
+            ..Default::default()
+        });
+        index.insert("a".to_string(), vec![0.0; 4]).unwrap();
+        index.insert("b".to_string(), vec![1.0; 4]).unwrap();
+        assert_eq!(index.count(), 2);
+
+        assert!(matches!(
+            index.delete("missing"),
+            Err(DiskAnnError::NotFound(id)) if id == "missing"
+        ));
+        assert!(index.delete_deferred("a").unwrap());
+        assert_eq!(index.count(), 1);
+        assert!(matches!(
+            index.delete("a"),
+            Err(DiskAnnError::NotFound(id)) if id == "a"
+        ));
+    }
+
+    #[test]
+    fn test_tombstones_survive_save_load() {
+        let dir = tempdir().unwrap();
+        let mut index = DiskAnnIndex::new(DiskAnnConfig {
+            dim: 8,
+            max_degree: 8,
+            build_beam: 16,
+            search_beam: 16,
+            ..Default::default()
+        });
+        let data = random_vectors(100, 8);
+        let deleted_query = data[9].1.clone();
+        index.insert_batch(data).unwrap();
+        index.build().unwrap();
+        index.delete_deferred("vec-9").unwrap();
+        index.save(dir.path()).unwrap();
+        assert_eq!(
+            fs::metadata(dir.path().join("tombstones.bin"))
+                .unwrap()
+                .len(),
+            16
+        );
+
+        let loaded = DiskAnnIndex::load(dir.path()).unwrap();
+        assert_eq!(loaded.count(), 99);
+        assert!(loaded
+            .search(&deleted_query, 10)
+            .unwrap()
+            .iter()
+            .all(|result| result.id != "vec-9"));
+    }
+
+    #[test]
+    #[ignore = "20k-vector recall regression; run explicitly for release validation"]
+    fn test_delete_repair_recall_regression_20k() {
+        use rand::prelude::*;
+        use std::collections::HashSet;
+
+        fn recall_at_10(
+            index: &DiskAnnIndex,
+            data: &[(String, Vec<f32>)],
+            survivors: &HashSet<usize>,
+            queries: &[usize],
+        ) -> f64 {
+            let mut matches = 0usize;
+            for &query_idx in queries {
+                let query = &data[query_idx].1;
+                let mut exact: Vec<(usize, f32)> = survivors
+                    .iter()
+                    .map(|&idx| (idx, l2_squared(&data[idx].1, query)))
+                    .collect();
+                exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+                let truth: HashSet<&str> = exact
+                    .iter()
+                    .take(10)
+                    .map(|(idx, _)| data[*idx].0.as_str())
+                    .collect();
+                matches += index
+                    .search(query, 10)
+                    .unwrap()
+                    .iter()
+                    .filter(|result| truth.contains(result.id.as_str()))
+                    .count();
+            }
+            matches as f64 / (queries.len() * 10) as f64
+        }
+
+        let n = 20_000;
+        let dim = 32;
+        let mut rng = StdRng::seed_from_u64(0x679D_15CA);
+        let data: Vec<(String, Vec<f32>)> = (0..n)
+            .map(|idx| {
+                (
+                    format!("v{idx}"),
+                    (0..dim).map(|_| rng.gen::<f32>()).collect(),
+                )
+            })
+            .collect();
+        let config = DiskAnnConfig {
+            dim,
+            max_degree: 32,
+            build_beam: 64,
+            search_beam: 64,
+            alpha: 1.2,
+            ..Default::default()
+        };
+
+        let dir = tempdir().unwrap();
+        let mut base = DiskAnnIndex::new(config.clone());
+        base.insert_batch(data.clone()).unwrap();
+        base.build().unwrap();
+        base.save(dir.path()).unwrap();
+        let mut repaired = DiskAnnIndex::load(dir.path()).unwrap();
+        let mut deferred = DiskAnnIndex::load(dir.path()).unwrap();
+
+        let mut order: Vec<usize> = (0..n).collect();
+        order.shuffle(&mut rng);
+        let deleted: HashSet<usize> = order[..n / 5].iter().copied().collect();
+        let survivors: HashSet<usize> = (0..n).filter(|idx| !deleted.contains(idx)).collect();
+        for &idx in &order[..n / 5] {
+            repaired.delete(&format!("v{idx}")).unwrap();
+            deferred.delete_deferred(&format!("v{idx}")).unwrap();
+        }
+
+        let survivor_data: Vec<(String, Vec<f32>)> =
+            survivors.iter().map(|&idx| data[idx].clone()).collect();
+        let mut fresh = DiskAnnIndex::new(config);
+        fresh.insert_batch(survivor_data).unwrap();
+        fresh.build().unwrap();
+        let queries: Vec<usize> = order[n / 5..n / 5 + 100].to_vec();
+        let repaired_recall = recall_at_10(&repaired, &data, &survivors, &queries);
+        let deferred_recall = recall_at_10(&deferred, &data, &survivors, &queries);
+        let fresh_recall = recall_at_10(&fresh, &data, &survivors, &queries);
+        println!(
+            "delete recall@10: deferred={deferred_recall:.4} repaired={repaired_recall:.4} fresh={fresh_recall:.4}"
+        );
+        assert!(
+            (repaired_recall - fresh_recall).abs() <= 0.02,
+            "repaired recall {repaired_recall:.4} differs from fresh recall {fresh_recall:.4} by more than 0.02"
+        );
     }
 
     #[test]

@@ -11,6 +11,12 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+fn is_tombstoned(tombstones: &[u64], node: usize) -> bool {
+    tombstones
+        .get(node / 64)
+        .is_some_and(|word| word & (1u64 << (node % 64)) != 0)
+}
+
 #[derive(Clone)]
 struct Candidate {
     id: u32,
@@ -19,7 +25,7 @@ struct Candidate {
 
 impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool {
-        self.distance == other.distance
+        self.distance.total_cmp(&other.distance) == Ordering::Equal
     }
 }
 impl Eq for Candidate {}
@@ -30,10 +36,7 @@ impl PartialOrd for Candidate {
 }
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .distance
-            .partial_cmp(&self.distance)
-            .unwrap_or(Ordering::Equal)
+        other.distance.total_cmp(&self.distance)
     }
 }
 
@@ -43,7 +46,7 @@ struct MaxCandidate {
 }
 impl PartialEq for MaxCandidate {
     fn eq(&self, other: &Self) -> bool {
-        self.distance == other.distance
+        self.distance.total_cmp(&other.distance) == Ordering::Equal
     }
 }
 impl Eq for MaxCandidate {}
@@ -54,9 +57,7 @@ impl PartialOrd for MaxCandidate {
 }
 impl Ord for MaxCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.distance
-            .partial_cmp(&other.distance)
-            .unwrap_or(Ordering::Equal)
+        self.distance.total_cmp(&other.distance)
     }
 }
 
@@ -198,7 +199,7 @@ impl VamanaGraph {
         }
 
         let mut result: Vec<(u32, f32)> = best.into_iter().map(|c| (c.id, c.distance)).collect();
-        result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        result.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
         let ids: Vec<u32> = result.into_iter().map(|(id, _)| id).collect();
 
         (ids, visit_count)
@@ -232,7 +233,7 @@ impl VamanaGraph {
             .filter(|&&c| c != node)
             .map(|&c| (c, l2_squared(vectors.get(c as usize), node_vec)))
             .collect();
-        sorted.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        sorted.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
 
         let mut result = Vec::with_capacity(self.max_degree);
         for (cand_id, cand_dist) in &sorted {
@@ -251,6 +252,67 @@ impl VamanaGraph {
             }
         }
         result
+    }
+
+    /// Remove a deleted node and locally repair each of its live in-neighbors.
+    ///
+    /// This index deliberately does not maintain reverse adjacency. Finding the
+    /// in-neighbors therefore performs a bounded scan of the graph and costs
+    /// O(n * degree) per deletion. Tombstoned sources and candidates are skipped.
+    pub(crate) fn repair_deleted(
+        &mut self,
+        vectors: &FlatVectors,
+        deleted: u32,
+        tombstones: &[u64],
+    ) {
+        let deleted_idx = deleted as usize;
+        if deleted_idx >= self.neighbors.len() || !is_tombstoned(tombstones, deleted_idx) {
+            return;
+        }
+
+        let deleted_out: Vec<u32> = self.neighbors[deleted_idx]
+            .iter()
+            .copied()
+            .filter(|&candidate| {
+                candidate != deleted && !is_tombstoned(tombstones, candidate as usize)
+            })
+            .collect();
+
+        if self.medoid == deleted {
+            if let Some(replacement) = deleted_out.first().copied().or_else(|| {
+                (0..self.neighbors.len())
+                    .find(|&node| !is_tombstoned(tombstones, node))
+                    .map(|idx| idx as u32)
+            }) {
+                self.medoid = replacement;
+            }
+        }
+
+        for source in 0..self.neighbors.len() {
+            if source == deleted_idx || !self.neighbors[source].contains(&deleted) {
+                continue;
+            }
+
+            if is_tombstoned(tombstones, source) {
+                self.neighbors[source].retain(|&neighbor| neighbor != deleted);
+                continue;
+            }
+
+            let mut candidates: Vec<u32> = self.neighbors[source]
+                .iter()
+                .copied()
+                .chain(deleted_out.iter().copied())
+                .filter(|&candidate| {
+                    candidate != deleted && !is_tombstoned(tombstones, candidate as usize)
+                })
+                .collect();
+            candidates.sort_unstable();
+            candidates.dedup();
+            self.neighbors[source] =
+                self.robust_prune(vectors, source as u32, &candidates, self.alpha);
+        }
+
+        self.neighbors[deleted_idx].clear();
     }
 
     /// Parallel medoid finding using rayon
@@ -274,7 +336,7 @@ impl VamanaGraph {
         (0..n as u32)
             .into_par_iter()
             .map(|i| (i, l2_squared(vectors.get(i as usize), &centroid)))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(id, _)| id)
             .unwrap_or(0)
     }

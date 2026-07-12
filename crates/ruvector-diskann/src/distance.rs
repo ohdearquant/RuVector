@@ -41,15 +41,6 @@ impl FlatVectors {
         &self.data[start..start + self.dim]
     }
 
-    /// Zero out a vector (lazy deletion)
-    #[inline]
-    pub fn zero_out(&mut self, idx: usize) {
-        let start = idx * self.dim;
-        for v in &mut self.data[start..start + self.dim] {
-            *v = f32::NAN;
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.count
     }
