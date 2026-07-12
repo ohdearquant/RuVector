@@ -1044,4 +1044,335 @@ mod tests {
             pq_guided.0 as i64 - exact.0 as i64
         );
     }
+
+    #[test]
+    #[ignore] // Slow (N=100k, PQ training) — run explicitly:
+              // cargo test -p ruvector-diskann --release -- --ignored --nocapture bench_pq_tuning_sweep_100k
+    fn bench_pq_tuning_sweep_100k() {
+        // #673 round 2 — query-time tuning sweep. Pre-registered gate and
+        // methodology: BENCH_673.md ("Round 2"), pre-registered before this
+        // harness was run. Builds ONE N=100k/dim=128 M=16 PQ index (same
+        // seeds as round 1's bench_pq_vs_exact_100k), then sweeps search
+        // list width L x exact re-rank pool size R at query time against
+        // that single build — no rebuild per cell.
+        //
+        // L = beam_width passed to greedy_search_pq (bounds the PQ-guided
+        // traversal frontier and what it returns, already sorted ascending
+        // by PQ distance).
+        // R = how many of the L returned candidates (the R closest by PQ
+        // distance) get exact-L2 reranked before taking top-k, capped at L.
+        use rand::prelude::*;
+        use std::time::Instant;
+
+        let n = 100_000;
+        let dim = 128;
+        let k = 10;
+        let m = 16; // PQ subspaces
+
+        // Round-1 exact-arm baseline (measured in bench_pq_vs_exact_100k,
+        // not rebuilt here) — the fixed reference the pre-registered gate
+        // in BENCH_673.md is defined against.
+        let exact_median_us: u128 = 695;
+        let exact_p95_us: u128 = 2010;
+        let exact_recall: f64 = 0.816;
+
+        let gate_recall = 0.80_f64;
+        let gate_median_us = (exact_median_us as f64 * 0.6) as u128; // 417us
+        let gate_p95_us = (exact_p95_us as f64 * 1.15) as u128; // 2311us
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xD15CA77);
+        let data: Vec<(String, Vec<f32>)> = (0..n)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim).map(|_| rng.gen()).collect();
+                (format!("v{i}"), v)
+            })
+            .collect();
+
+        // Ground truth: same methodology + seed as round 1.
+        let num_gt_queries = 50;
+        let mut gt_rng = rand::rngs::StdRng::seed_from_u64(0xBEEF);
+        let query_indices: Vec<usize> = (0..num_gt_queries)
+            .map(|_| gt_rng.gen_range(0..n))
+            .collect();
+        let ground_truth: Vec<std::collections::HashSet<String>> = query_indices
+            .iter()
+            .map(|&qi| {
+                let query = &data[qi].1;
+                let mut brute: Vec<(usize, f32)> = data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, v))| (i, crate::distance::l2_squared(v, query)))
+                    .collect();
+                brute.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                brute[..k].iter().map(|(i, _)| data[*i].0.clone()).collect()
+            })
+            .collect();
+
+        // Latency query pool: same methodology + seed as round 1.
+        let warmup = 20;
+        let timed = 200;
+        let mut lrng = rand::rngs::StdRng::seed_from_u64(0xFACEB00C);
+        let query_pool: Vec<usize> = (0..(warmup + timed))
+            .map(|_| lrng.gen_range(0..n))
+            .collect();
+
+        // ONE M=16 build, reused across every (L, R) cell below.
+        let mut index = DiskAnnIndex::new(DiskAnnConfig {
+            dim,
+            max_degree: 48,
+            build_beam: 96,
+            search_beam: 64,
+            alpha: 1.2,
+            pq_subspaces: m,
+            pq_iterations: 8,
+            ..Default::default()
+        });
+        index.insert_batch(data.clone()).unwrap();
+        let t0 = Instant::now();
+        index.build().unwrap();
+        let build_ms = t0.elapsed().as_millis();
+        println!("[M=16 build] {build_ms}ms (n={n} dim={dim} pq_subspaces={m})");
+
+        let graph = index.graph.as_ref().unwrap();
+        let pq = index.pq.as_ref().unwrap();
+
+        // Runs one (L, R) cell against the already-built index above.
+        let run_cell = |l: usize, r: usize| -> (f64, u128, u128) {
+            let r_eff = r.min(l);
+
+            // Recall@10 over the shared ground-truth query set.
+            let mut total_recall = 0.0;
+            for (qi, gt) in query_indices.iter().zip(ground_truth.iter()) {
+                let query = &data[*qi].1;
+                let table = pq.build_distance_table(query).unwrap();
+                let (candidates, _) = graph.greedy_search_pq(&index.pq_codes, &table, l);
+                let pool = &candidates[..candidates.len().min(r_eff)];
+                let mut scored: Vec<(u32, f32)> = pool
+                    .iter()
+                    .map(|&id| {
+                        (
+                            id,
+                            crate::distance::l2_squared(index.vectors.get(id as usize), query),
+                        )
+                    })
+                    .collect();
+                scored.sort_unstable_by(|a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let found: std::collections::HashSet<String> = scored
+                    .into_iter()
+                    .take(k)
+                    .map(|(id, _)| index.id_map[id as usize].clone())
+                    .collect();
+                total_recall += gt.intersection(&found).count() as f64 / k as f64;
+            }
+            let avg_recall = total_recall / num_gt_queries as f64;
+
+            // Latency: same warmup + timed pool as round 1, full query
+            // pipeline (table build + PQ-guided traversal + exact rerank).
+            for &qi in query_pool.iter().take(warmup) {
+                let query = &data[qi].1;
+                let table = pq.build_distance_table(query).unwrap();
+                let (candidates, _) = graph.greedy_search_pq(&index.pq_codes, &table, l);
+                let pool = &candidates[..candidates.len().min(r_eff)];
+                let _: Vec<(u32, f32)> = pool
+                    .iter()
+                    .map(|&id| {
+                        (
+                            id,
+                            crate::distance::l2_squared(index.vectors.get(id as usize), query),
+                        )
+                    })
+                    .collect();
+            }
+            let mut latencies_us: Vec<u128> = Vec::with_capacity(timed);
+            for &qi in query_pool.iter().skip(warmup) {
+                let query = &data[qi].1;
+                let t0 = Instant::now();
+                let table = pq.build_distance_table(query).unwrap();
+                let (candidates, _) = graph.greedy_search_pq(&index.pq_codes, &table, l);
+                let pool = &candidates[..candidates.len().min(r_eff)];
+                let mut scored: Vec<(u32, f32)> = pool
+                    .iter()
+                    .map(|&id| {
+                        (
+                            id,
+                            crate::distance::l2_squared(index.vectors.get(id as usize), query),
+                        )
+                    })
+                    .collect();
+                scored.sort_unstable_by(|a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let _ = scored.into_iter().take(k).count();
+                latencies_us.push(t0.elapsed().as_micros());
+            }
+            latencies_us.sort_unstable();
+            let median_us = latencies_us[latencies_us.len() / 2];
+            let p95_us = latencies_us[(latencies_us.len() as f64 * 0.95) as usize];
+
+            (avg_recall, median_us, p95_us)
+        };
+
+        let ls = [64usize, 128, 256];
+        let rs = [10usize, 30, 100];
+        let mut results: Vec<(usize, usize, f64, u128, u128, bool)> = Vec::new();
+
+        for &l in &ls {
+            for &r in &rs {
+                let (recall, median_us, p95_us) = run_cell(l, r);
+                let pass =
+                    recall >= gate_recall && median_us <= gate_median_us && p95_us <= gate_p95_us;
+                println!(
+                    "[L={l} R={r} (r_eff={})] recall@{k}={recall:.3} median={median_us}us p95={p95_us}us pass={pass}",
+                    r.min(l)
+                );
+                results.push((l, r, recall, median_us, p95_us, pass));
+            }
+        }
+
+        println!(
+            "\n=== #673 round 2 tuning sweep (n={n}, dim={dim}, M={m}, build={build_ms}ms) ==="
+        );
+        println!(
+            "gate: recall@10>={gate_recall:.2} median<={gate_median_us}us p95<={gate_p95_us}us \
+             (vs exact-arm baseline recall={exact_recall:.3} median={exact_median_us}us p95={exact_p95_us}us)"
+        );
+        for (l, r, recall, median_us, p95_us, pass) in &results {
+            println!(
+                "L={l:<4} R={r:<4} recall@10={recall:.3} median={median_us:>5}us p95={p95_us:>5}us pass={pass}"
+            );
+        }
+
+        let best = results
+            .iter()
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .cloned();
+        if let Some((bl, br, brecall, bmedian, bp95, _)) = best {
+            println!(
+                "\nbest-by-recall cell: L={bl} R={br} recall@10={brecall:.3} median={bmedian}us p95={bp95}us"
+            );
+        }
+
+        let passing: Vec<&(usize, usize, f64, u128, u128, bool)> =
+            results.iter().filter(|r| r.5).collect();
+        let any_pass = !passing.is_empty();
+        println!("\nany config clears the gate: {any_pass}");
+        for (l, r, recall, median_us, p95_us, _) in &passing {
+            println!(
+                "  PASS: L={l} R={r} recall@10={recall:.3} median={median_us}us p95={p95_us}us"
+            );
+        }
+
+        // Escalation: only if nothing passed but the best recall is within
+        // ~0.05 of the gate, add ONE M=32 rebuild arm at the best (L, R).
+        if !any_pass {
+            if let Some((bl, br, brecall, _, _, _)) = best {
+                if brecall >= gate_recall - 0.05 {
+                    println!(
+                        "\nbest cell recall {brecall:.3} within 0.05 of gate {gate_recall:.2} \
+                         — running ONE M=32 rebuild arm at L={bl} R={br}"
+                    );
+                    let m32 = 32usize;
+                    let mut index32 = DiskAnnIndex::new(DiskAnnConfig {
+                        dim,
+                        max_degree: 48,
+                        build_beam: 96,
+                        search_beam: 64,
+                        alpha: 1.2,
+                        pq_subspaces: m32,
+                        pq_iterations: 8,
+                        ..Default::default()
+                    });
+                    index32.insert_batch(data.clone()).unwrap();
+                    let t0 = Instant::now();
+                    index32.build().unwrap();
+                    let build32_ms = t0.elapsed().as_millis();
+
+                    let graph32 = index32.graph.as_ref().unwrap();
+                    let pq32 = index32.pq.as_ref().unwrap();
+                    let r_eff = br.min(bl);
+
+                    let mut total_recall = 0.0;
+                    for (qi, gt) in query_indices.iter().zip(ground_truth.iter()) {
+                        let query = &data[*qi].1;
+                        let table = pq32.build_distance_table(query).unwrap();
+                        let (candidates, _) =
+                            graph32.greedy_search_pq(&index32.pq_codes, &table, bl);
+                        let pool = &candidates[..candidates.len().min(r_eff)];
+                        let mut scored: Vec<(u32, f32)> = pool
+                            .iter()
+                            .map(|&id| {
+                                (
+                                    id,
+                                    crate::distance::l2_squared(
+                                        index32.vectors.get(id as usize),
+                                        query,
+                                    ),
+                                )
+                            })
+                            .collect();
+                        scored.sort_unstable_by(|a, b| {
+                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let found: std::collections::HashSet<String> = scored
+                            .into_iter()
+                            .take(k)
+                            .map(|(id, _)| index32.id_map[id as usize].clone())
+                            .collect();
+                        total_recall += gt.intersection(&found).count() as f64 / k as f64;
+                    }
+                    let avg_recall32 = total_recall / num_gt_queries as f64;
+
+                    for &qi in query_pool.iter().take(warmup) {
+                        let query = &data[qi].1;
+                        let table = pq32.build_distance_table(query).unwrap();
+                        let _ = graph32.greedy_search_pq(&index32.pq_codes, &table, bl);
+                    }
+                    let mut latencies32_us: Vec<u128> = Vec::with_capacity(timed);
+                    for &qi in query_pool.iter().skip(warmup) {
+                        let query = &data[qi].1;
+                        let t0 = Instant::now();
+                        let table = pq32.build_distance_table(query).unwrap();
+                        let (candidates, _) =
+                            graph32.greedy_search_pq(&index32.pq_codes, &table, bl);
+                        let pool = &candidates[..candidates.len().min(r_eff)];
+                        let mut scored: Vec<(u32, f32)> = pool
+                            .iter()
+                            .map(|&id| {
+                                (
+                                    id,
+                                    crate::distance::l2_squared(
+                                        index32.vectors.get(id as usize),
+                                        query,
+                                    ),
+                                )
+                            })
+                            .collect();
+                        scored.sort_unstable_by(|a, b| {
+                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let _ = scored.into_iter().take(k).count();
+                        latencies32_us.push(t0.elapsed().as_micros());
+                    }
+                    latencies32_us.sort_unstable();
+                    let median32_us = latencies32_us[latencies32_us.len() / 2];
+                    let p9532_us = latencies32_us[(latencies32_us.len() as f64 * 0.95) as usize];
+
+                    let pass32 = avg_recall32 >= gate_recall
+                        && median32_us <= gate_median_us
+                        && p9532_us <= gate_p95_us;
+                    println!(
+                        "[M=32 build={build32_ms}ms L={bl} R={br}] recall@{k}={avg_recall32:.3} \
+                         median={median32_us}us p95={p9532_us}us pass={pass32}"
+                    );
+                } else {
+                    println!(
+                        "\nbest cell recall {brecall:.3} not within 0.05 of gate {gate_recall:.2} \
+                         — skipping M=32 escalation per pre-registered plan"
+                    );
+                }
+            }
+        }
+    }
 }
