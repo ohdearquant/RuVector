@@ -19,6 +19,25 @@ ignore = [
     # Re-evaluate when the `rsa` crate ships a constant-time implementation.
     "RUSTSEC-2023-0071",
 
+    # quick-xml 0.26.0 — memory-exhaustion DoS via unbounded namespace-
+    # declaration allocation (RUSTSEC-2026-0195) and quadratic run time on
+    # duplicate-attribute checks (RUSTSEC-2026-0194), both severity 7.5.
+    # Pulled transitively only via `inferno` (flamegraph rendering) <-
+    # `pprof` (optional `profiling` feature of ruvector-bench, never a
+    # production dependency). No lockfile-only bump is possible: `pprof`
+    # 0.15.0 (the newest release on crates.io as of this review) still
+    # requires `inferno = "^0.11"`, and `inferno` 0.11.21 (the newest
+    # patch in that line) still requires `quick-xml = "^0.26"` — verified
+    # directly via `cargo update -p inferno`/`cargo update -p quick-xml`
+    # dry runs, not from changelog inspection alone. quick-xml here only
+    # parses profiler-internal XML on the local machine (never
+    # network-facing or attacker-supplied input), so the DoS surface is
+    # not reachable in our usage even before a fix ships. Re-review when
+    # `pprof` cuts a release depending on `inferno` >=0.12, or track
+    # https://github.com/jonhoo/inferno for a quick-xml bump.
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0194",
+
     # ------------------------------------------------------------------
     # "Unmaintained" warnings (informational, not vulnerabilities)
     # ------------------------------------------------------------------
