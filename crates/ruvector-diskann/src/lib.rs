@@ -19,6 +19,7 @@ pub mod pq;
 #[cfg(feature = "reuse-under-drift")]
 pub mod reuse;
 
+pub use distance::VisitedSet;
 pub use error::{DiskAnnError, Result};
 pub use index::{DiskAnnConfig, DiskAnnIndex};
 pub use pq::ProductQuantizer;

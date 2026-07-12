@@ -141,7 +141,7 @@ impl VamanaGraph {
         beam_width: usize,
         visited: &mut VisitedSet,
     ) -> (Vec<u32>, usize) {
-        visited.clear();
+        visited.prepare(vectors.len());
 
         let mut candidates = BinaryHeap::<Candidate>::new();
         let mut best = BinaryHeap::<MaxCandidate>::new();

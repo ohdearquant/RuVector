@@ -199,7 +199,30 @@ impl VisitedSet {
     /// Reset for a new search — O(1) via generation counter
     #[inline]
     pub fn clear(&mut self) {
-        self.generation += 1;
+        if self.generation == u64::MAX {
+            self.bits.fill(0);
+            self.gens.fill(0);
+            self.generation = 1;
+        } else {
+            self.generation += 1;
+        }
+    }
+
+    /// Prepare this set for an index of `n` nodes.
+    ///
+    /// A size mismatch reinitializes the backing storage. Repeated use with the
+    /// same index size takes the O(1) generation-counter path in [`Self::clear`].
+    #[inline]
+    pub(crate) fn prepare(&mut self, n: usize) {
+        if self.gens.len() != n {
+            self.bits.resize((n + 63) / 64, 0);
+            self.bits.fill(0);
+            self.gens.resize(n, 0);
+            self.gens.fill(0);
+            self.generation = 1;
+        } else {
+            self.clear();
+        }
     }
 
     /// Mark node as visited
@@ -339,6 +362,31 @@ mod tests {
         assert!(!vs.contains(42));
         vs.insert(43);
         assert!(vs.contains(43));
+    }
+
+    #[test]
+    fn test_visited_set_generation_wrap() {
+        let mut vs = VisitedSet::new(100);
+        vs.generation = u64::MAX;
+        vs.insert(42);
+
+        vs.clear();
+
+        assert_eq!(vs.generation, 1);
+        assert!(!vs.contains(42));
+    }
+
+    #[test]
+    fn test_visited_set_size_mismatch_reinitializes() {
+        let mut vs = VisitedSet::new(2);
+        vs.insert(1);
+
+        vs.prepare(100);
+
+        assert_eq!(vs.gens.len(), 100);
+        assert!(!vs.contains(1));
+        vs.insert(99);
+        assert!(vs.contains(99));
     }
 
     #[test]

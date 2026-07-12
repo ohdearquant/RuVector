@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, TryLockError};
+
+const MAX_VISITED_POOL_SIZE: usize = 4;
 
 /// Search result
 #[derive(Debug, Clone)]
@@ -70,8 +73,8 @@ pub struct DiskAnnIndex {
     pq_codes: Vec<Vec<u8>>,
     /// Whether index has been built
     built: bool,
-    /// Reusable visited set for search (avoids per-query allocation)
-    visited: Option<VisitedSet>,
+    /// Small pool of reusable visited sets for shared-reference searches.
+    visited_pool: Mutex<Vec<VisitedSet>>,
     /// Memory-mapped vector data (for large datasets)
     mmap: Option<Mmap>,
 }
@@ -89,7 +92,7 @@ impl DiskAnnIndex {
             pq: None,
             pq_codes: Vec::new(),
             built: false,
-            visited: None,
+            visited_pool: Mutex::new(Vec::new()),
             mmap: None,
         }
     }
@@ -154,8 +157,12 @@ impl DiskAnnIndex {
         graph.build(&self.vectors)?;
         self.graph = Some(graph);
 
-        // Pre-allocate visited set for search
-        self.visited = Some(VisitedSet::new(n));
+        // Seed the single-threaded fast path. Concurrent searches allocate a
+        // fallback set when every pooled set is checked out.
+        *self
+            .visited_pool
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![VisitedSet::new(n)];
         self.built = true;
 
         if let Some(ref path) = self.config.storage_path {
@@ -167,20 +174,49 @@ impl DiskAnnIndex {
 
     /// Search for k nearest neighbors
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        if !self.built {
-            return Err(DiskAnnError::NotBuilt);
+        self.validate_search(query)?;
+
+        let mut visited = match self.visited_pool.try_lock() {
+            Ok(mut pool) => pool
+                .pop()
+                .unwrap_or_else(|| VisitedSet::new(self.vectors.len())),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned
+                .into_inner()
+                .pop()
+                .unwrap_or_else(|| VisitedSet::new(self.vectors.len())),
+            Err(TryLockError::WouldBlock) => VisitedSet::new(self.vectors.len()),
+        };
+
+        let result = self.search_with(query, k, &mut visited);
+
+        let mut pool = self
+            .visited_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pool.len() < MAX_VISITED_POOL_SIZE {
+            pool.push(visited);
         }
-        if query.len() != self.config.dim {
-            return Err(DiskAnnError::DimensionMismatch {
-                expected: self.config.dim,
-                actual: query.len(),
-            });
-        }
+
+        result
+    }
+
+    /// Search with caller-owned visited-state storage.
+    ///
+    /// Reuse the same [`VisitedSet`] for steady-state searches without visited
+    /// set allocation. If its size differs from this index, the set is resized
+    /// and fully reset before the search.
+    pub fn search_with(
+        &self,
+        query: &[f32],
+        k: usize,
+        visited: &mut VisitedSet,
+    ) -> Result<Vec<SearchResult>> {
+        self.validate_search(query)?;
 
         let graph = self.graph.as_ref().unwrap();
         let beam = self.config.search_beam.max(k);
 
-        let (candidates, _) = graph.greedy_search(&self.vectors, query, beam);
+        let (candidates, _) = graph.greedy_search_fast(&self.vectors, query, beam, visited);
 
         // Re-rank candidates with exact distance
         let mut scored: Vec<(u32, f32)> = candidates
@@ -197,6 +233,20 @@ impl DiskAnnIndex {
                 distance: dist,
             })
             .collect())
+    }
+
+    fn validate_search(&self, query: &[f32]) -> Result<()> {
+        if !self.built {
+            return Err(DiskAnnError::NotBuilt);
+        }
+        if query.len() != self.config.dim {
+            return Err(DiskAnnError::DimensionMismatch {
+                expected: self.config.dim,
+                actual: query.len(),
+            });
+        }
+
+        Ok(())
     }
 
     /// Get the number of vectors in the index
@@ -407,7 +457,7 @@ impl DiskAnnIndex {
             pq,
             pq_codes,
             built: true,
-            visited: Some(VisitedSet::new(n)),
+            visited_pool: Mutex::new(vec![VisitedSet::new(n)]),
             mmap: Some(mmap),
         })
     }
@@ -457,6 +507,64 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].id, "vec-42"); // Should find itself
         assert!(results[0].distance < 1e-6); // Exact match
+    }
+
+    #[test]
+    fn search_paths_return_identical_ids() {
+        use rand::prelude::*;
+
+        let dim = 32;
+        let n = 500;
+        let mut index = DiskAnnIndex::new(DiskAnnConfig {
+            dim,
+            max_degree: 16,
+            build_beam: 32,
+            search_beam: 32,
+            alpha: 1.2,
+            ..Default::default()
+        });
+        index.insert_batch(random_vectors(n, dim)).unwrap();
+        index.build().unwrap();
+
+        let mut query_rng = rand::rngs::StdRng::seed_from_u64(0x6775_EA2C);
+        let mut visited = VisitedSet::new(n);
+
+        for _ in 0..100 {
+            let query: Vec<f32> = (0..dim).map(|_| query_rng.gen()).collect();
+            let pooled_ids: Vec<String> = index
+                .search(&query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|result| result.id)
+                .collect();
+            let caller_owned_ids: Vec<String> = index
+                .search_with(&query, 10, &mut visited)
+                .unwrap()
+                .into_iter()
+                .map(|result| result.id)
+                .collect();
+
+            // This mirrors the pre-fix search shape: allocate a VisitedSet in
+            // graph.greedy_search, then perform the same exact-distance rerank.
+            let graph = index.graph.as_ref().unwrap();
+            let beam = index.config.search_beam.max(10);
+            let (candidates, _) = graph.greedy_search(&index.vectors, &query, beam);
+            let mut scored: Vec<(u32, f32)> = candidates
+                .into_iter()
+                .map(|id| (id, l2_squared(index.vectors.get(id as usize), &query)))
+                .collect();
+            scored.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let old_path_ids: Vec<String> = scored
+                .into_iter()
+                .take(10)
+                .map(|(id, _)| index.id_map[id as usize].clone())
+                .collect();
+
+            assert_eq!(pooled_ids, old_path_ids);
+            assert_eq!(caller_owned_ids, old_path_ids);
+        }
     }
 
     #[test]
