@@ -707,10 +707,7 @@ mod tests {
 
     #[test]
     fn safetensors_precision_label_follows_torch_dtype() {
-        let dir = std::env::temp_dir().join(format!(
-            "lattice-dtype-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("lattice-dtype-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("config.json");
         for (dtype, expected) in [
