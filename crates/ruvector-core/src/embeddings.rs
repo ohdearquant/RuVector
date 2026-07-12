@@ -783,6 +783,17 @@ pub use onnx::OnnxEmbedding;
 /// symmetric (contrastive training on raw text, no prefix), so its two methods
 /// are equivalent.
 ///
+/// ## Normalization
+/// Both [`EmbeddingProvider::embed`] and [`LatticeEmbedding::embed_query`]
+/// return L2-normalized vectors (unit length): `lattice-embed`'s BERT-family
+/// encode path (used for BGE, E5, and MiniLM) calls `l2_normalize`
+/// unconditionally on the pooled output, both for single-text and batched
+/// encoding (`BertModel::encode` / `encode_batch` in
+/// `crates/inference/src/model/bert.rs`, upstream in
+/// [`lattice-embed`](https://crates.io/crates/lattice-embed)'s
+/// `lattice-inference` dependency). This holds regardless of distance
+/// metric — safe to use with a dot-product index as well as cosine.
+///
 /// # Example
 /// ```rust,no_run
 /// use ruvector_core::embeddings::{EmbeddingProvider, LatticeEmbedding};
@@ -1073,6 +1084,37 @@ pub mod lattice_native {
                 LatticeEmbedding::from_pretrained("bge-small-en-v1.5").is_ok(),
                 "native local model 'bge-small-en-v1.5' must construct successfully"
             );
+        }
+
+        /// #662: pins the bge-small alias surface this provider accepts.
+        /// `ruvector-extensions`' `LatticeWasmEmbeddings` (the WASM sibling of
+        /// this provider) mirrors this same alias set
+        /// (`normalizeLatticeWasmModel` in
+        /// `npm/packages/ruvector-extensions/src/embeddings.ts`) so a model id
+        /// valid for one Lattice-backed provider is valid for the other.
+        #[test]
+        fn from_pretrained_accepts_bge_small_alias_surface() {
+            for alias in [
+                "bge-small-en-v1.5",
+                "bge-small-en",
+                "bge-small",
+                "small",
+                "BAAI/bge-small-en-v1.5",
+                "BGE_SMALL_EN_V1.5",
+            ] {
+                let provider = LatticeEmbedding::from_pretrained(alias)
+                    .unwrap_or_else(|e| panic!("alias '{alias}' must resolve to bge-small: {e}"));
+                assert_eq!(
+                    provider.dimensions(),
+                    384,
+                    "alias '{alias}' resolved to the wrong dimensionality"
+                );
+                assert_eq!(
+                    provider.name(),
+                    "BAAI/bge-small-en-v1.5",
+                    "alias '{alias}' resolved to a different model than 'bge-small-en-v1.5'"
+                );
+            }
         }
 
         /// Regression test for the nested-runtime panic: `embed` / `embed_query`
