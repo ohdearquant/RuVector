@@ -1137,6 +1137,86 @@ pub mod lattice_native {
                 .expect("embed_query must not panic or error from inside a Tokio runtime");
             assert_eq!(query.len(), provider.dimensions());
         }
+
+        /// Cross-provider contract test (maintainer follow-up on #663).
+        ///
+        /// This provider never builds the prefixed query string itself: `embed_query`
+        /// forwards raw `text` to `EmbeddingService::embed_query`, which prepends
+        /// `model.query_instruction()` internally (see `send_request` above and
+        /// `lattice_embed::EmbeddingService::embed_query`'s default impl). So the
+        /// prefix this provider *effectively* applies for a given model **is**
+        /// `LatticeEmbeddingModel::query_instruction()` / `document_instruction()` --
+        /// both documented `**Stable**` in lattice-embed's own API-stability
+        /// convention (`crates/embed/src/model.rs` in ohdearquant/lattice).
+        ///
+        /// `ruvector-extensions`' WASM sibling provider has no such delegation
+        /// (`@khive-ai/lattice-embed-wasm`'s `embed()` binding takes raw text only,
+        /// no prefix concept), so it hardcodes the same prefixes as a TS literal
+        /// map (`LATTICE_WASM_QUERY_INSTRUCTIONS` in
+        /// `npm/packages/ruvector-extensions/src/embeddings.ts`) and asserts against
+        /// the identical fixture in its own contract test
+        /// (`npm/packages/ruvector-extensions/tests/lattice-prefix-contract.test.ts`).
+        /// Both tests read `fixtures/lattice-embed/query-prefixes.json` at the repo
+        /// root, so a future lattice-embed bump that changes either model's
+        /// convention fails this test on the Rust side (and its TS sibling
+        /// independently), instead of the two providers silently re-diverging the
+        /// way they did before #663.
+        #[test]
+        fn cross_provider_query_prefix_contract() {
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                "../../../fixtures/lattice-embed/query-prefixes.json"
+            ))
+            .expect("fixtures/lattice-embed/query-prefixes.json must be valid JSON");
+
+            let models = fixture["models"]
+                .as_object()
+                .expect("fixture must have a top-level 'models' object");
+            assert!(
+                !models.is_empty(),
+                "fixture 'models' must not be empty -- an empty fixture would make this \
+                 contract test vacuously pass"
+            );
+            assert!(
+                models.contains_key("bge-small"),
+                "fixture must cover 'bge-small' -- the model #662 was about"
+            );
+            assert!(
+                models.contains_key("minilm"),
+                "fixture must cover 'minilm' as the symmetric control case"
+            );
+
+            for (alias, expected) in models {
+                let model: LatticeEmbeddingModel = alias.parse().unwrap_or_else(|e| {
+                    panic!(
+                        "fixture alias '{alias}' must be a valid lattice_embed::EmbeddingModel: {e}"
+                    )
+                });
+
+                let expected_query_prefix = expected["query_prefix"].as_str();
+                assert_eq!(
+                    model.query_instruction(),
+                    expected_query_prefix,
+                    "query prefix mismatch for '{alias}': lattice_embed::EmbeddingModel::\
+                     query_instruction() returned {:?} but fixtures/lattice-embed/\
+                     query-prefixes.json expects {:?}. If lattice-embed intentionally changed \
+                     this model's convention, update the fixture AND the TS sibling test in \
+                     npm/packages/ruvector-extensions/tests/lattice-prefix-contract.test.ts \
+                     together.",
+                    model.query_instruction(),
+                    expected_query_prefix
+                );
+
+                let expected_passage_prefix = expected["passage_prefix"].as_str();
+                assert_eq!(
+                    model.document_instruction(),
+                    expected_passage_prefix,
+                    "passage prefix mismatch for '{alias}': lattice_embed::EmbeddingModel::\
+                     document_instruction() returned {:?} but the fixture expects {:?}",
+                    model.document_instruction(),
+                    expected_passage_prefix
+                );
+            }
+        }
     }
 }
 
