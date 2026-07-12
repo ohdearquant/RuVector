@@ -180,7 +180,29 @@ impl DiskAnnIndex {
         let graph = self.graph.as_ref().unwrap();
         let beam = self.config.search_beam.max(k);
 
-        let (candidates, _) = graph.greedy_search(&self.vectors, query, beam);
+        // PQ-guided traversal (#673): when build() trained a quantizer, score
+        // candidate hops via the per-query asymmetric distance table instead
+        // of exact L2, then re-rank the returned beam with exact distance
+        // below — per ADR-144's own search design. No PQ configured
+        // (pq_subspaces == 0, the default) means `self.pq` stays `None` and
+        // this takes the exact-only path unchanged.
+        //
+        // Both arms route through the `_fast` graph entry points with a
+        // locally-owned `VisitedSet`, the same shape `search_with`-style
+        // reusable-visited-state callers use, rather than the self-allocating
+        // `greedy_search`/`greedy_search_pq` wrappers.
+        let candidates = if let Some(ref pq) = self.pq {
+            let table = pq.build_distance_table(query)?;
+            let mut visited = VisitedSet::new(self.pq_codes.len());
+            graph
+                .greedy_search_pq_fast(&self.pq_codes, &table, beam, &mut visited)
+                .0
+        } else {
+            let mut visited = VisitedSet::new(self.vectors.len());
+            graph
+                .greedy_search_fast(&self.vectors, query, beam, &mut visited)
+                .0
+        };
 
         // Re-rank candidates with exact distance
         let mut scored: Vec<(u32, f32)> = candidates
@@ -574,6 +596,247 @@ mod tests {
     }
 
     #[test]
+    fn test_recall_at_10_with_pq_guided_search() {
+        // Same seeded 2k x 64d harness as test_recall_at_10, but pq_subspaces
+        // is configured (#673) so search() takes the PQ-guided traversal path
+        // instead of exact L2 during the graph walk. Recall must clear the
+        // same bar as the exact path — the final exact re-rank absorbs most
+        // of the approximation loss from PQ-scored hops.
+        use rand::prelude::*;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xD15CA77);
+        let n = 2000;
+        let dim = 64;
+        let k = 10;
+
+        let data: Vec<(String, Vec<f32>)> = (0..n)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim).map(|_| rng.gen()).collect();
+                (format!("v{i}"), v)
+            })
+            .collect();
+
+        let mut index = DiskAnnIndex::new(DiskAnnConfig {
+            dim,
+            max_degree: 32,
+            build_beam: 64,
+            search_beam: 64,
+            alpha: 1.2,
+            pq_subspaces: 8,
+            pq_iterations: 10,
+            ..Default::default()
+        });
+        index.insert_batch(data.clone()).unwrap();
+        index.build().unwrap();
+
+        let num_queries = 50;
+        let mut total_recall = 0.0;
+
+        for _ in 0..num_queries {
+            let qi = rng.gen_range(0..n);
+            let query = &data[qi].1;
+
+            let mut brute: Vec<(usize, f32)> = data
+                .iter()
+                .enumerate()
+                .map(|(i, (_, v))| (i, crate::distance::l2_squared(v, query)))
+                .collect();
+            brute.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let gt: std::collections::HashSet<String> =
+                brute[..k].iter().map(|(i, _)| data[*i].0.clone()).collect();
+
+            let results = index.search(query, k).unwrap();
+            let found: std::collections::HashSet<String> =
+                results.iter().map(|r| r.id.clone()).collect();
+
+            let recall = gt.intersection(&found).count() as f64 / k as f64;
+            total_recall += recall;
+        }
+
+        let avg_recall = total_recall / num_queries as f64;
+        println!(
+            "PQ-guided Recall@{k} = {avg_recall:.3} (n={n}, dim={dim}, queries={num_queries}, pq_subspaces=8)"
+        );
+        assert!(
+            avg_recall >= 0.85,
+            "PQ-guided Recall@{k} = {avg_recall:.3}, expected >= 0.85"
+        );
+    }
+
+    #[test]
+    fn test_search_without_pq_matches_exact_reference_path() {
+        // #673: search() now branches on self.pq.is_some(). With
+        // pq_subspaces == 0 (the default), pq stays None and search() must
+        // still take exactly the pre-#673 exact-L2 path. Verified by
+        // replicating that path by hand (graph.greedy_search + the same
+        // re-rank loop search() runs) and asserting identical ids and
+        // distances on a seeded fixture.
+        use rand::prelude::*;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xD15CA77);
+        let n = 500;
+        let dim = 32;
+        let k = 10;
+
+        let data: Vec<(String, Vec<f32>)> = (0..n)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim).map(|_| rng.gen()).collect();
+                (format!("v{i}"), v)
+            })
+            .collect();
+
+        let mut index = DiskAnnIndex::new(DiskAnnConfig {
+            dim,
+            max_degree: 16,
+            build_beam: 32,
+            search_beam: 32,
+            alpha: 1.2,
+            ..Default::default() // pq_subspaces: 0 — no PQ trained
+        });
+        index.insert_batch(data.clone()).unwrap();
+        index.build().unwrap();
+        assert!(
+            index.pq.is_none(),
+            "pq_subspaces=0 must not train a quantizer"
+        );
+
+        let query = &data[3].1;
+        let via_search = index.search(query, k).unwrap();
+
+        // Hand-replicated pre-#673 exact path (identical to the `else`
+        // branch search() runs internally).
+        let graph = index.graph.as_ref().unwrap();
+        let beam = index.config.search_beam.max(k);
+        let (candidates, _) = graph.greedy_search(&index.vectors, query, beam);
+        let mut scored: Vec<(u32, f32)> = candidates
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    crate::distance::l2_squared(index.vectors.get(id as usize), query),
+                )
+            })
+            .collect();
+        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let reference: Vec<(String, f32)> = scored
+            .into_iter()
+            .take(k)
+            .map(|(id, dist)| (index.id_map[id as usize].clone(), dist))
+            .collect();
+
+        assert_eq!(via_search.len(), reference.len());
+        for (a, (rid, rdist)) in via_search.iter().zip(reference.iter()) {
+            assert_eq!(&a.id, rid, "id order must match the pre-#673 exact path");
+            assert_eq!(
+                a.distance, *rdist,
+                "distance must match the pre-#673 exact path exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pq_guided_search_degrades_with_corrupted_distance_table() {
+        // Mutation check for #673: PQ-guided traversal must actually depend
+        // on the distance table's content, not just its shape. Build a
+        // normal PQ index, confirm recall clears the usual bar with the
+        // correct per-query table, then corrupt the table (rotate each
+        // subspace's 256-entry block by one slot — same shape, wrong
+        // content) and confirm recall collapses. A traversal that silently
+        // ignored the table would pass with either table; this fails that.
+        use rand::prelude::*;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xD15CA77);
+        let n = 2000;
+        let dim = 64;
+        let k = 10;
+
+        let data: Vec<(String, Vec<f32>)> = (0..n)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim).map(|_| rng.gen()).collect();
+                (format!("v{i}"), v)
+            })
+            .collect();
+
+        let mut index = DiskAnnIndex::new(DiskAnnConfig {
+            dim,
+            max_degree: 32,
+            build_beam: 64,
+            search_beam: 64,
+            alpha: 1.2,
+            pq_subspaces: 8,
+            pq_iterations: 10,
+            ..Default::default()
+        });
+        index.insert_batch(data.clone()).unwrap();
+        index.build().unwrap();
+
+        let pq = index.pq.as_ref().unwrap().clone();
+        let graph = index.graph.as_ref().unwrap();
+        let pq_codes = &index.pq_codes;
+        let beam = index.config.search_beam.max(k);
+
+        let num_queries = 30;
+        let mut recall_correct = 0.0;
+        let mut recall_corrupted = 0.0;
+        let mut qrng = rand::rngs::StdRng::seed_from_u64(0xBEEF);
+
+        for _ in 0..num_queries {
+            let qi = qrng.gen_range(0..n);
+            let query = &data[qi].1;
+
+            let mut brute: Vec<(usize, f32)> = data
+                .iter()
+                .enumerate()
+                .map(|(i, (_, v))| (i, crate::distance::l2_squared(v, query)))
+                .collect();
+            brute.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let gt: std::collections::HashSet<u32> =
+                brute[..k].iter().map(|(i, _)| *i as u32).collect();
+
+            // Exact re-rank of the traversal's candidate set — mirrors what
+            // search() does with the beam it gets back from greedy_search_pq.
+            let rerank = |cands: Vec<u32>| -> std::collections::HashSet<u32> {
+                let mut scored: Vec<(u32, f32)> = cands
+                    .into_iter()
+                    .map(|id| (id, crate::distance::l2_squared(&data[id as usize].1, query)))
+                    .collect();
+                scored.sort_unstable_by(|a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                scored.into_iter().take(k).map(|(id, _)| id).collect()
+            };
+
+            let table = pq.build_distance_table(query).unwrap();
+            let (cands, _) = graph.greedy_search_pq(pq_codes, &table, beam);
+            let found = rerank(cands);
+            recall_correct += gt.intersection(&found).count() as f64 / k as f64;
+
+            let mut corrupted = table.clone();
+            for sub in 0..pq.m {
+                let base = sub * 256;
+                corrupted[base..base + 256].rotate_left(1);
+            }
+            let (cands_bad, _) = graph.greedy_search_pq(pq_codes, &corrupted, beam);
+            let found_bad = rerank(cands_bad);
+            recall_corrupted += gt.intersection(&found_bad).count() as f64 / k as f64;
+        }
+
+        let avg_correct = recall_correct / num_queries as f64;
+        let avg_corrupted = recall_corrupted / num_queries as f64;
+        println!(
+            "PQ table-integrity check: correct-table recall={avg_correct:.3}, corrupted-table recall={avg_corrupted:.3}"
+        );
+
+        assert!(
+            avg_correct >= 0.85,
+            "correct-table recall {avg_correct:.3} should clear the usual 0.85 bar"
+        );
+        assert!(
+            avg_corrupted < avg_correct - 0.2,
+            "corrupted-table recall {avg_corrupted:.3} should collapse well below \
+             correct-table recall {avg_correct:.3} if traversal genuinely depends on \
+             distance-table content"
+        );
+    }
+
+    #[test]
     fn test_dimension_mismatch() {
         let mut index = DiskAnnIndex::new(DiskAnnConfig {
             dim: 16,
@@ -657,6 +920,128 @@ mod tests {
         assert!(
             search_us < 10_000,
             "Search took {search_us}µs, expected <10ms"
+        );
+    }
+
+    #[test]
+    #[ignore] // Slow (N=100k, PQ training) — run explicitly:
+              // cargo test -p ruvector-diskann --release -- --ignored --nocapture bench_pq_vs_exact_100k
+    fn bench_pq_vs_exact_100k() {
+        // #673 A/B evidence: exact-traversal search vs PQ-guided search at
+        // N=100_000, dim=128 (this crate's own test_scale_5k convention,
+        // scaled up), M=16 PQ subspaces. Reports recall@10 against a shared
+        // brute-force ground truth, median/p95 query latency over >=200
+        // timed queries after warmup, and the PQ-arm's build-time overhead
+        // vs the exact arm.
+        use rand::prelude::*;
+        use std::time::Instant;
+
+        let n = 100_000;
+        let dim = 128;
+        let k = 10;
+        let m = 16; // PQ subspaces
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xD15CA77);
+        let data: Vec<(String, Vec<f32>)> = (0..n)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim).map(|_| rng.gen()).collect();
+                (format!("v{i}"), v)
+            })
+            .collect();
+
+        // Ground truth: brute-force top-k for a fixed, shared query set.
+        let num_gt_queries = 50;
+        let mut gt_rng = rand::rngs::StdRng::seed_from_u64(0xBEEF);
+        let query_indices: Vec<usize> = (0..num_gt_queries)
+            .map(|_| gt_rng.gen_range(0..n))
+            .collect();
+        let ground_truth: Vec<std::collections::HashSet<String>> = query_indices
+            .iter()
+            .map(|&qi| {
+                let query = &data[qi].1;
+                let mut brute: Vec<(usize, f32)> = data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, v))| (i, crate::distance::l2_squared(v, query)))
+                    .collect();
+                brute.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                brute[..k].iter().map(|(i, _)| data[*i].0.clone()).collect()
+            })
+            .collect();
+
+        let measure_arm = |label: &str, pq_subspaces: usize| -> (u128, f64, u128, u128) {
+            let mut index = DiskAnnIndex::new(DiskAnnConfig {
+                dim,
+                max_degree: 48,
+                build_beam: 96,
+                search_beam: 64,
+                alpha: 1.2,
+                pq_subspaces,
+                pq_iterations: 8,
+                ..Default::default()
+            });
+            index.insert_batch(data.clone()).unwrap();
+
+            let t0 = Instant::now();
+            index.build().unwrap();
+            let build_ms = t0.elapsed().as_millis();
+
+            // Recall@10 over the shared ground-truth query set.
+            let mut total_recall = 0.0;
+            for (qi, gt) in query_indices.iter().zip(ground_truth.iter()) {
+                let query = &data[*qi].1;
+                let results = index.search(query, k).unwrap();
+                let found: std::collections::HashSet<String> =
+                    results.iter().map(|r| r.id.clone()).collect();
+                total_recall += gt.intersection(&found).count() as f64 / k as f64;
+            }
+            let avg_recall = total_recall / num_gt_queries as f64;
+
+            // Latency: warmup + >=200 timed queries.
+            let warmup = 20;
+            let timed = 200;
+            let mut lrng = rand::rngs::StdRng::seed_from_u64(0xFACEB00C);
+            let query_pool: Vec<usize> = (0..(warmup + timed))
+                .map(|_| lrng.gen_range(0..n))
+                .collect();
+
+            for &qi in query_pool.iter().take(warmup) {
+                let _ = index.search(&data[qi].1, k).unwrap();
+            }
+            let mut latencies_us: Vec<u128> = Vec::with_capacity(timed);
+            for &qi in query_pool.iter().skip(warmup) {
+                let t0 = Instant::now();
+                let _ = index.search(&data[qi].1, k).unwrap();
+                latencies_us.push(t0.elapsed().as_micros());
+            }
+            latencies_us.sort_unstable();
+            let median_us = latencies_us[latencies_us.len() / 2];
+            let p95_us = latencies_us[(latencies_us.len() as f64 * 0.95) as usize];
+
+            println!(
+                "[{label}] build={build_ms}ms recall@{k}={avg_recall:.3} \
+                 median={median_us}us p95={p95_us}us (n={n} dim={dim} pq_subspaces={pq_subspaces})"
+            );
+            (build_ms, avg_recall, median_us, p95_us)
+        };
+
+        let exact = measure_arm("exact-traversal (pq_subspaces=0)", 0);
+        let pq_guided = measure_arm("PQ-guided (pq_subspaces=16)", m);
+
+        println!(
+            "\n=== #673 A/B summary (n={n}, dim={dim}, M={m}) ===\n\
+             exact:      build={}ms recall@10={:.3} median={}us p95={}us\n\
+             PQ-guided:  build={}ms recall@10={:.3} median={}us p95={}us\n\
+             PQ arm build-time overhead vs exact arm: {}ms",
+            exact.0,
+            exact.1,
+            exact.2,
+            exact.3,
+            pq_guided.0,
+            pq_guided.1,
+            pq_guided.2,
+            pq_guided.3,
+            pq_guided.0 as i64 - exact.0 as i64
         );
     }
 }

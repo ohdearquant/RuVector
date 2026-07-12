@@ -5,7 +5,7 @@
 //! - VisitedSet (O(1) clear via generation counter)
 //! - Rayon-parallel medoid finding
 
-use crate::distance::{l2_squared, FlatVectors, VisitedSet};
+use crate::distance::{l2_squared, pq_asymmetric_distance, FlatVectors, VisitedSet};
 use crate::error::{DiskAnnError, Result};
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -133,21 +133,26 @@ impl VamanaGraph {
         Ok(())
     }
 
-    /// Greedy beam search with reusable VisitedSet (zero-alloc per query)
-    pub fn greedy_search_fast(
+    /// Shared greedy beam-search core (#673): the traversal/pruning logic is
+    /// identical whether a hop is scored by exact L2 or by PQ asymmetric
+    /// distance — only the per-candidate distance function differs. Callers
+    /// supply that as `dist`, evaluated once per newly-visited node id.
+    fn greedy_search_core<F>(
         &self,
-        vectors: &FlatVectors,
-        query: &[f32],
         beam_width: usize,
         visited: &mut VisitedSet,
-    ) -> (Vec<u32>, usize) {
+        dist: F,
+    ) -> (Vec<u32>, usize)
+    where
+        F: Fn(u32) -> f32,
+    {
         visited.clear();
 
         let mut candidates = BinaryHeap::<Candidate>::new();
         let mut best = BinaryHeap::<MaxCandidate>::new();
 
         let start = self.medoid;
-        let start_dist = l2_squared(vectors.get(start as usize), query);
+        let start_dist = dist(start);
         candidates.push(Candidate {
             id: start,
             distance: start_dist,
@@ -176,19 +181,19 @@ impl VamanaGraph {
                 visited.insert(neighbor);
                 visit_count += 1;
 
-                let dist = l2_squared(vectors.get(neighbor as usize), query);
+                let d = dist(neighbor);
 
                 let dominated =
-                    best.len() >= beam_width && best.peek().map_or(false, |w| dist >= w.distance);
+                    best.len() >= beam_width && best.peek().map_or(false, |w| d >= w.distance);
 
                 if !dominated {
                     candidates.push(Candidate {
                         id: neighbor,
-                        distance: dist,
+                        distance: d,
                     });
                     best.push(MaxCandidate {
                         id: neighbor,
-                        distance: dist,
+                        distance: d,
                     });
                     if best.len() > beam_width {
                         best.pop();
@@ -204,6 +209,19 @@ impl VamanaGraph {
         (ids, visit_count)
     }
 
+    /// Greedy beam search with reusable VisitedSet (zero-alloc per query)
+    pub fn greedy_search_fast(
+        &self,
+        vectors: &FlatVectors,
+        query: &[f32],
+        beam_width: usize,
+        visited: &mut VisitedSet,
+    ) -> (Vec<u32>, usize) {
+        self.greedy_search_core(beam_width, visited, |id| {
+            l2_squared(vectors.get(id as usize), query)
+        })
+    }
+
     /// Public search entry point (allocates its own VisitedSet)
     pub fn greedy_search(
         &self,
@@ -213,6 +231,35 @@ impl VamanaGraph {
     ) -> (Vec<u32>, usize) {
         let mut visited = VisitedSet::new(vectors.len());
         self.greedy_search_fast(vectors, query, beam_width, &mut visited)
+    }
+
+    /// Greedy beam search scored via PQ asymmetric distance (#673) instead of
+    /// exact L2 — O(M) table lookups per candidate instead of O(dim) mul-adds.
+    /// `table` is the flat per-query distance table from
+    /// `ProductQuantizer::build_distance_table` (`table[sub * 256 + code]`).
+    /// Callers re-rank the returned candidates with exact L2 before returning
+    /// results (see `DiskAnnIndex::search`) — this only guides the traversal.
+    pub fn greedy_search_pq_fast(
+        &self,
+        pq_codes: &[Vec<u8>],
+        table: &[f32],
+        beam_width: usize,
+        visited: &mut VisitedSet,
+    ) -> (Vec<u32>, usize) {
+        self.greedy_search_core(beam_width, visited, |id| {
+            pq_asymmetric_distance(&pq_codes[id as usize], table, 256)
+        })
+    }
+
+    /// Public PQ-guided search entry point (allocates its own VisitedSet)
+    pub fn greedy_search_pq(
+        &self,
+        pq_codes: &[Vec<u8>],
+        table: &[f32],
+        beam_width: usize,
+    ) -> (Vec<u32>, usize) {
+        let mut visited = VisitedSet::new(pq_codes.len());
+        self.greedy_search_pq_fast(pq_codes, table, beam_width, &mut visited)
     }
 
     fn robust_prune(
