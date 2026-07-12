@@ -26,8 +26,20 @@ parking_lot = "0.12"
 bytemuck = { version = "1.14", features = ["derive"] }
 simsimd = { workspace = true, optional = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `rand` (used by PQ k-means training) pulls getrandom 0.2 transitively, which
+# needs the "js" backend to build for wasm32-unknown-unknown. Same shim as
+# ruvector-wasm/Cargo.toml.
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
 [dev-dependencies]
 tempfile = "3.9"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+# wasm32 SIMD128 correctness + A/B timing tests (`wasm-pack test --node`).
+wasm-bindgen-test = "0.3"
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
 
 # Workspace cleanup pass: research-tier crate, doc/style churn deferred. Correctness + suspicious lints stay denied.
 [lints.rust]
