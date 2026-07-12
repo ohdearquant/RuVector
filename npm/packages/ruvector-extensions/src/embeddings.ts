@@ -764,6 +764,138 @@ export class HuggingFaceEmbeddings extends EmbeddingProvider {
 }
 
 // ============================================================================
+// Lattice WASM Embeddings Provider
+// ============================================================================
+
+/**
+ * Configuration for lattice-embed-wasm local embeddings
+ */
+export interface LatticeWasmEmbeddingsConfig {
+  /** Model name (default: 'minilm'). See the supported-model list in the class doc. */
+  model?: string;
+  /** Retry configuration */
+  retryConfig?: Partial<RetryConfig>;
+}
+
+/**
+ * Known lattice-embed-wasm models and their output dimensionality. Both are
+ * symmetric BERT-family encoders (no query/passage prefix at the wasm layer).
+ */
+const LATTICE_WASM_MODEL_DIMENSIONS: Record<string, number> = {
+  minilm: 384,
+  'bge-small': 384,
+};
+
+/**
+ * Local embeddings provider backed by `@khive-ai/lattice-embed-wasm`, a
+ * pure-Rust BERT-family text embedder compiled to WebAssembly.
+ *
+ * Node-only: the wasm adapter resolves model weights via `node:fs`, so this
+ * provider does not run in a browser. Single-text only: the wasm package
+ * exposes no batch API, so {@link getMaxBatchSize} honestly reports `1`
+ * rather than simulating a larger batch. Output embeddings are
+ * L2-normalized and symmetric (no query/passage asymmetry at the wasm
+ * layer, unlike some hosted embedding APIs).
+ *
+ * This is a convenience local-embedder option at parity with the existing
+ * `HuggingFaceEmbeddings` (transformers.js) local path above, not a faster
+ * or higher-quality alternative to it.
+ */
+export class LatticeWasmEmbeddings extends EmbeddingProvider {
+  private model: string;
+  private dimension: number;
+
+  /**
+   * Creates a new lattice-embed-wasm local embeddings provider
+   * @param config - Configuration options
+   * @throws Error if the configured model is not one lattice-embed-wasm supports
+   */
+  constructor(config: LatticeWasmEmbeddingsConfig = {}) {
+    super(config.retryConfig);
+
+    const model = config.model || 'minilm';
+    const dimension = LATTICE_WASM_MODEL_DIMENSIONS[model];
+
+    if (dimension === undefined) {
+      throw new Error(
+        `Unknown lattice-embed-wasm model "${model}". Supported models: ${Object.keys(
+          LATTICE_WASM_MODEL_DIMENSIONS
+        ).join(', ')}`
+      );
+    }
+
+    this.model = model;
+    this.dimension = dimension;
+  }
+
+  getMaxBatchSize(): number {
+    // lattice-embed-wasm embeds one text per call; there is no batch API to
+    // wrap, so this honestly reports 1 rather than faking a larger batch.
+    return 1;
+  }
+
+  getDimension(): number {
+    return this.dimension;
+  }
+
+  async embedTexts(texts: string[]): Promise<BatchEmbeddingResult> {
+    if (texts.length === 0) {
+      return { embeddings: [] };
+    }
+
+    let lattice: any;
+    try {
+      // Dynamic import to support optional peer dependency. The specifier is
+      // read from a variable (rather than passed as a literal) so
+      // TypeScript does not attempt to statically resolve module types for
+      // a peer that may not be installed.
+      const specifier = '@khive-ai/lattice-embed-wasm';
+      lattice = await import(specifier);
+    } catch (error) {
+      throw new Error(
+        'lattice-embed-wasm not found. Install it with: npm install @khive-ai/lattice-embed-wasm'
+      );
+    }
+
+    // No batch API: embed one text at a time. Node caches the dynamic
+    // import above by specifier, so repeated calls do not re-import.
+    const allResults: EmbeddingResult[] = [];
+
+    for (let i = 0; i < texts.length; i++) {
+      const text = texts[i];
+
+      const vector = await this.withRetry(async () => {
+        const result = await lattice.embed(text, this.model);
+
+        if (result === null) {
+          // For an explicitly-selected provider, a null result is a real
+          // failure (unknown model, unsupported over wasm, or weights that
+          // could not be resolved/verified) -- never a silent skip.
+          throw new Error(
+            `lattice-embed-wasm returned null embedding for model "${this.model}": the model is unknown, unsupported over wasm, or its weights could not be resolved`
+          );
+        }
+
+        return result as Float32Array;
+      }, `lattice-embed-wasm embedding for text ${i + 1}/${texts.length}`);
+
+      allResults.push({
+        embedding: Array.from(vector),
+        index: i,
+      });
+    }
+
+    return {
+      embeddings: allResults,
+      metadata: {
+        model: this.model,
+        provider: 'lattice-wasm',
+      },
+    };
+  }
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -919,6 +1051,7 @@ export default {
   CohereEmbeddings,
   AnthropicEmbeddings,
   HuggingFaceEmbeddings,
+  LatticeWasmEmbeddings,
 
   // Helper functions
   embedAndInsert,

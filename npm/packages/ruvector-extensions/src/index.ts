@@ -19,6 +19,7 @@ export {
   CohereEmbeddings,
   AnthropicEmbeddings,
   HuggingFaceEmbeddings,
+  LatticeWasmEmbeddings,
 
   // Helper functions
   embedAndInsert,
@@ -34,6 +35,7 @@ export {
   type CohereEmbeddingsConfig,
   type AnthropicEmbeddingsConfig,
   type HuggingFaceEmbeddingsConfig,
+  type LatticeWasmEmbeddingsConfig,
 } from './embeddings.js';
 
 // Re-export default for convenience
