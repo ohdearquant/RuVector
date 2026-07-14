@@ -201,7 +201,7 @@ fn main() -> Result<()> {
     println!();
 
     // Update difficulty stats with average steps
-    for (_, stats) in raw_metrics.by_difficulty.iter_mut() {
+    for stats in raw_metrics.by_difficulty.values_mut() {
         if stats.attempted > 0 {
             // This is a simplification - we'd need to track this properly
             stats.avg_steps = raw_metrics.total_steps as f64 / raw_metrics.tasks_attempted as f64;
