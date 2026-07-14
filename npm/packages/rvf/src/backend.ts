@@ -110,6 +110,21 @@ export class NodeBackend implements RvfBackend {
   async create(path: string, options: RvfOptions): Promise<void> {
     await this.loadNative();
     try {
+      // Precondition: refuse to clobber an existing file unless asked to.
+      // The native layer surfaces this as a misleading FsyncFailed, so check
+      // here and raise a clear, actionable error (or honor `overwrite`).
+      const fs = await import('fs');
+      if (fs.existsSync(path)) {
+        if (options.overwrite) {
+          fs.rmSync(path, { force: true });
+          fs.rmSync(`${path}.idmap.json`, { force: true });
+        } else {
+          throw new RvfError(
+            RvfErrorCode.FileExists,
+            `${path} already exists; use RvfDatabase.open() to reuse it, or pass { overwrite: true } to replace it`,
+          );
+        }
+      }
       this.handle = await this.native.create(path, mapOptionsToNative(options));
       this.storePath = path;
       this.idToLabel.clear();

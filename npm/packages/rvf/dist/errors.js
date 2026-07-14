@@ -51,6 +51,8 @@ var RvfErrorCode;
     RvfErrorCode[RvfErrorCode["BackendInitFailed"] = 65281] = "BackendInitFailed";
     RvfErrorCode[RvfErrorCode["StoreClosed"] = 65282] = "StoreClosed";
     RvfErrorCode[RvfErrorCode["InvalidOptions"] = 65283] = "InvalidOptions";
+    RvfErrorCode[RvfErrorCode["FileExists"] = 65284] = "FileExists";
+    RvfErrorCode[RvfErrorCode["InvalidArgument"] = 65285] = "InvalidArgument";
 })(RvfErrorCode || (exports.RvfErrorCode = RvfErrorCode = {}));
 /** Human-readable labels for each error code. */
 const ERROR_MESSAGES = {
@@ -90,6 +92,8 @@ const ERROR_MESSAGES = {
     [RvfErrorCode.BackendInitFailed]: 'Backend initialization failed',
     [RvfErrorCode.StoreClosed]: 'Store has been closed',
     [RvfErrorCode.InvalidOptions]: 'Invalid store creation options',
+    [RvfErrorCode.FileExists]: 'A file already exists at the target path',
+    [RvfErrorCode.InvalidArgument]: 'Invalid argument',
 };
 /**
  * Custom error class for all RVF operations.

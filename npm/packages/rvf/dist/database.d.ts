@@ -1,4 +1,4 @@
-import type { RvfOptions, RvfQueryOptions, RvfSearchResult, RvfIngestResult, RvfIngestEntry, RvfDeleteResult, RvfCompactionResult, RvfStatus, RvfFilterExpr, RvfKernelData, RvfEbpfData, RvfSegmentInfo, BackendType } from './types';
+import type { RvfOptions, RvfQueryOptions, RvfSearchResult, RvfQueryOptionsWithCount, RvfIngestResult, RvfIngestEntry, RvfDeleteResult, RvfCompactionResult, RvfStatus, RvfFilterExpr, RvfKernelData, RvfEbpfData, RvfSegmentInfo, BackendType } from './types';
 import type { RvfBackend } from './backend';
 /**
  * Main user-facing RVF database class.
@@ -65,12 +65,18 @@ export declare class RvfDatabase {
     /**
      * Query for the `k` nearest neighbors of a given vector.
      *
+     * The count can be passed positionally (`query(vec, 10)`) or via an
+     * options object (`query(vec, { k: 10, efSearch: 200 })`, with `topK`
+     * and `limit` accepted as aliases for `k`). Passing an object without a
+     * usable count, or a non-positive-integer count, throws a clear
+     * {@link RvfErrorCode.InvalidArgument} rather than a low-level N-API error.
+     *
      * @param vector   The query embedding.
-     * @param k        Number of results to return.
+     * @param k        Number of results, or an options object carrying it.
      * @param options  Optional query parameters (efSearch, filter, timeout).
      * @returns        Sorted search results (closest first).
      */
-    query(vector: Float32Array | number[], k: number, options?: RvfQueryOptions): Promise<RvfSearchResult[]>;
+    query(vector: Float32Array | number[], k: number | RvfQueryOptionsWithCount, options?: RvfQueryOptions): Promise<RvfSearchResult[]>;
     /**
      * Run compaction to reclaim dead space from soft-deleted vectors.
      */

@@ -19,6 +19,7 @@
   "scripts": {
     "build": "tsc",
     "test": "jest",
+    "smoke": "node scripts/smoke-query-create.mjs",
     "bench": "tsx bench/index.ts",
     "typecheck": "tsc --noEmit"
   },
