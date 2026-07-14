@@ -51,6 +51,9 @@ var RvfErrorCode;
     RvfErrorCode[RvfErrorCode["BackendInitFailed"] = 65281] = "BackendInitFailed";
     RvfErrorCode[RvfErrorCode["StoreClosed"] = 65282] = "StoreClosed";
     RvfErrorCode[RvfErrorCode["InvalidOptions"] = 65283] = "InvalidOptions";
+    // (0xff04–0xff05 reserved)
+    RvfErrorCode[RvfErrorCode["SidecarWriteFailed"] = 65286] = "SidecarWriteFailed";
+    RvfErrorCode[RvfErrorCode["SidecarCorrupt"] = 65287] = "SidecarCorrupt";
 })(RvfErrorCode || (exports.RvfErrorCode = RvfErrorCode = {}));
 /** Human-readable labels for each error code. */
 const ERROR_MESSAGES = {
@@ -90,6 +93,8 @@ const ERROR_MESSAGES = {
     [RvfErrorCode.BackendInitFailed]: 'Backend initialization failed',
     [RvfErrorCode.StoreClosed]: 'Store has been closed',
     [RvfErrorCode.InvalidOptions]: 'Invalid store creation options',
+    [RvfErrorCode.SidecarWriteFailed]: 'Failed to persist the string-id map sidecar',
+    [RvfErrorCode.SidecarCorrupt]: 'The string-id map sidecar is missing fields or corrupt',
 };
 /**
  * Custom error class for all RVF operations.

@@ -19,6 +19,7 @@
   "scripts": {
     "build": "tsc",
     "test": "jest",
+    "smoke:idmap": "node scripts/smoke-idmap-durability.mjs",
     "bench": "tsx bench/index.ts",
     "typecheck": "tsc --noEmit"
   },

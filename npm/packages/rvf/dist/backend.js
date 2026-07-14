@@ -15,23 +15,13 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 }) : function(o, v) {
     o["default"] = v;
 });
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.WasmBackend = exports.NodeBackend = void 0;
 exports.resolveBackend = resolveBackend;
@@ -377,41 +367,77 @@ class NodeBackend {
     mappingsPath() {
         return this.storePath ? this.storePath + '.idmap.json' : '';
     }
-    /** Persist the string↔label mapping to a sidecar JSON file. */
+    /**
+     * Persist the string↔label mapping to a sidecar JSON file.
+     *
+     * `delete()` resolves string ids through this map and silently filters out
+     * anything unresolvable, so a lost or torn write turns every ingest since
+     * the last good save into an undeletable-by-id vector. Persistence is
+     * therefore NOT best-effort: the write is made atomic (temp file + rename,
+     * so a crash/ENOSPC mid-write can never leave partial JSON at `mp`) and a
+     * failure is surfaced rather than swallowed.
+     */
     async saveMappings() {
         const mp = this.mappingsPath();
         if (!mp)
             return;
+        const fs = await Promise.resolve().then(() => __importStar(require('fs')));
+        const data = JSON.stringify({
+            idToLabel: Object.fromEntries(this.idToLabel),
+            labelToId: Object.fromEntries(Array.from(this.labelToId.entries()).map(([k, v]) => [String(k), v])),
+            nextLabel: this.nextLabel,
+        });
+        const tmp = `${mp}.tmp`;
         try {
-            const fs = await Promise.resolve().then(() => __importStar(require('fs')));
-            const data = JSON.stringify({
-                idToLabel: Object.fromEntries(this.idToLabel),
-                labelToId: Object.fromEntries(Array.from(this.labelToId.entries()).map(([k, v]) => [String(k), v])),
-                nextLabel: this.nextLabel,
-            });
-            fs.writeFileSync(mp, data, 'utf-8');
+            fs.writeFileSync(tmp, data, 'utf-8');
+            fs.renameSync(tmp, mp);
         }
-        catch {
-            // Non-fatal: mapping persistence is best-effort (e.g. read-only FS).
+        catch (err) {
+            try {
+                fs.rmSync(tmp, { force: true });
+            }
+            catch {
+                // best-effort cleanup of the temp file
+            }
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.SidecarWriteFailed, `at ${mp}: ${err instanceof Error ? err.message : String(err)}`);
         }
     }
-    /** Load the string↔label mapping from the sidecar JSON file if it exists. */
+    /**
+     * Load the string↔label mapping from the sidecar JSON file if it exists.
+     *
+     * A corrupt sidecar must NOT degrade to empty maps: `nextLabel` would reset
+     * to 1 and subsequent ingests would assign labels colliding with existing
+     * vectors (silent data corruption), and the next `saveMappings()` would
+     * overwrite the recoverable file. Instead the corrupt sidecar is quarantined
+     * (renamed aside so it is not clobbered) and a `SidecarCorrupt` error is
+     * raised so the caller learns string-id operations are unsafe.
+     */
     async loadMappings() {
         const mp = this.mappingsPath();
         if (!mp)
             return;
+        const fs = await Promise.resolve().then(() => __importStar(require('fs')));
+        if (!fs.existsSync(mp))
+            return; // fresh store: no sidecar yet is legitimate
+        let parsed;
         try {
-            const fs = await Promise.resolve().then(() => __importStar(require('fs')));
-            if (!fs.existsSync(mp))
-                return;
-            const raw = JSON.parse(fs.readFileSync(mp, 'utf-8'));
-            this.idToLabel = new Map(Object.entries(raw.idToLabel ?? {}).map(([k, v]) => [k, Number(v)]));
-            this.labelToId = new Map(Object.entries(raw.labelToId ?? {}).map(([k, v]) => [Number(k), v]));
-            this.nextLabel = raw.nextLabel ?? this.idToLabel.size + 1;
+            parsed = JSON.parse(fs.readFileSync(mp, 'utf-8'));
         }
-        catch {
-            // Non-fatal: start with empty mappings.
+        catch (err) {
+            const quarantine = `${mp}.corrupt-${Date.now()}`;
+            try {
+                fs.renameSync(mp, quarantine);
+            }
+            catch {
+                // if we cannot move it aside, leave it in place — still fail loud
+            }
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.SidecarCorrupt, `at ${mp} (quarantined to ${quarantine}): string-id delete()/ingest would ` +
+                `silently corrupt data — restore a valid sidecar or recreate the store; ` +
+                `${err instanceof Error ? err.message : String(err)}`);
         }
+        this.idToLabel = new Map(Object.entries(parsed.idToLabel ?? {}).map(([k, v]) => [k, Number(v)]));
+        this.labelToId = new Map(Object.entries(parsed.labelToId ?? {}).map(([k, v]) => [Number(k), v]));
+        this.nextLabel = parsed.nextLabel ?? this.idToLabel.size + 1;
     }
 }
 exports.NodeBackend = NodeBackend;

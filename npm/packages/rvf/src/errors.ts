@@ -53,6 +53,9 @@ export enum RvfErrorCode {
   BackendInitFailed = 0xff01,
   StoreClosed = 0xff02,
   InvalidOptions = 0xff03,
+  // (0xff04–0xff05 reserved)
+  SidecarWriteFailed = 0xff06,
+  SidecarCorrupt = 0xff07,
 }
 
 /** Human-readable labels for each error code. */
@@ -93,6 +96,8 @@ const ERROR_MESSAGES: Record<number, string> = {
   [RvfErrorCode.BackendInitFailed]: 'Backend initialization failed',
   [RvfErrorCode.StoreClosed]: 'Store has been closed',
   [RvfErrorCode.InvalidOptions]: 'Invalid store creation options',
+  [RvfErrorCode.SidecarWriteFailed]: 'Failed to persist the string-id map sidecar',
+  [RvfErrorCode.SidecarCorrupt]: 'The string-id map sidecar is missing fields or corrupt',
 };
 
 /**
