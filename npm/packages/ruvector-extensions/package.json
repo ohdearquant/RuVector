@@ -37,7 +37,7 @@
   "peerDependencies": {
     "openai": "^4.0.0",
     "cohere-ai": "^7.0.0",
-    "@khive-ai/lattice-embed-wasm": "^0.1.0"
+    "@khive-ai/lattice-embed-wasm": "^0.6.1"
   },
   "peerDependenciesMeta": {
     "openai": {
