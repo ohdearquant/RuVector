@@ -197,7 +197,7 @@ fn render_network_graph(net: &GeneNetwork, x: i32, y: i32, w: i32, h: i32) -> St
         ));
         s.push_str(&format!(
             "<text x=\"{:.0}\" y=\"{:.0}\" text-anchor=\"middle\" dominant-baseline=\"middle\" font-size=\"8\" fill=\"white\">{}</text>\n",
-            px, py, &net.gene_labels[i]
+            px, py, net.gene_labels[i]
         ));
     }
 
