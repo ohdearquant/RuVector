@@ -40,6 +40,7 @@ export declare enum RvfErrorCode {
     BackendInitFailed = 65281,
     StoreClosed = 65282,
     InvalidOptions = 65283,
+    MetadataNotSupported = 65284,
     SidecarWriteFailed = 65286,
     SidecarCorrupt = 65287
 }

@@ -191,7 +191,7 @@ pub fn load_index<R: Read>(r: &mut R) -> Result<RabitqPlusIndex> {
     if &magic != MAGIC {
         return Err(io_err(format!(
             "bad magic: expected {:?}, got {:?}",
-            MAGIC, &magic
+            MAGIC, magic
         )));
     }
 

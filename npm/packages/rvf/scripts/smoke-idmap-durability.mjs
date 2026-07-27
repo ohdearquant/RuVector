@@ -39,7 +39,9 @@ const sidecar = `${target}.idmap.json`;
 
   const sc = JSON.parse(fs.readFileSync(sidecar, 'utf-8'));
   assert.strictEqual(sc.nextLabel, 3, 'two ids -> labels 1,2 -> nextLabel 3');
-  assert.ok(!fs.existsSync(`${sidecar}.tmp`), 'atomic write leaves no .tmp file');
+  const tempPrefix = `${path.basename(sidecar)}.`;
+  const tempFiles = fs.readdirSync(tmp).filter((f) => f.startsWith(tempPrefix) && f.endsWith('.tmp'));
+  assert.deepStrictEqual(tempFiles, [], 'atomic write leaves no temporary sidecar');
   ok('#635 ingest persists sidecar atomically (nextLabel=3, no .tmp)');
 }
 
@@ -71,6 +73,38 @@ const sidecar = `${target}.idmap.json`;
   const quarantined = fs.readdirSync(tmp).filter((f) => f.includes('.idmap.json.corrupt-'));
   assert.strictEqual(quarantined.length, 1, 'exactly one quarantine file created');
   ok('#635 corrupt sidecar -> SidecarCorrupt + quarantined (no silent empty-map reset)');
+}
+
+// 4. Valid JSON with an invalid/missing schema is also corruption. Parsing it
+//    as empty maps would recreate the same label-collision failure.
+{
+  fs.writeFileSync(sidecar, '{}', 'utf-8');
+  await assert.rejects(
+    () => RvfDatabase.open(target, 'node'),
+    (e) => e instanceof RvfError && e.code === RvfErrorCode.SidecarCorrupt,
+    'open() on a structurally invalid sidecar should throw SidecarCorrupt',
+  );
+  const quarantined = fs.readdirSync(tmp).filter((f) => f.includes('.idmap.json.corrupt-'));
+  assert.strictEqual(quarantined.length, 2, 'invalid-schema sidecar is also quarantined');
+  ok('#635 invalid sidecar schema -> SidecarCorrupt + quarantine');
+}
+
+// 5. A sidecar write failure must not leak the native store lock. close()
+//    still releases the handle before surfacing SidecarWriteFailed.
+{
+  const lockTarget = path.join(tmp, 'write-failure.rvf');
+  const lockSidecar = `${lockTarget}.idmap.json`;
+  const db = await RvfDatabase.create(lockTarget, { dimensions: 4 }, 'node');
+  fs.mkdirSync(lockSidecar);
+  await assert.rejects(
+    () => db.close(),
+    (e) => e instanceof RvfError && e.code === RvfErrorCode.SidecarWriteFailed,
+    'close() should surface a sidecar persistence failure',
+  );
+  fs.rmdirSync(lockSidecar);
+  const reopened = await RvfDatabase.open(lockTarget, 'node');
+  await reopened.close();
+  ok('#635 sidecar write failure surfaces without leaking the native lock');
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

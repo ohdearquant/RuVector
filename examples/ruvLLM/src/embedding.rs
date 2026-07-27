@@ -1,14 +1,35 @@
 //! Embedding service with tokenization and caching
 //!
 //! Provides text-to-vector conversion with LRU caching for efficiency.
+//!
+//! Two backends are available:
+//! - **Random** (default): a random-init character-level matrix + sinusoidal
+//!   positions + mean-pooling. Fast, requires no download, but **not
+//!   semantic** — it does not discriminate between related and unrelated
+//!   text (see `EmbeddingBackend::Random`'s docs below).
+//! - **Lattice** (feature `lattice-embeddings`, opt-in): real pretrained
+//!   sentence embeddings via [`ruvector_core::embeddings::LatticeEmbedding`],
+//!   a pure-Rust native embedder (no ONNX Runtime, no C++ FFI). Selected at
+//!   runtime by requesting a model id (see [`EmbeddingService::new`]); a
+//!   pretrained model is a ~90-130MB download on first use, so this backend
+//!   is never enabled implicitly.
 
 use crate::config::EmbeddingConfig;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use ahash::AHashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::num::NonZeroUsize;
+
+#[cfg(feature = "lattice-embeddings")]
+use ruvector_core::embeddings::{EmbeddingProvider, LatticeEmbedding};
+
+/// Environment variable used to request a pretrained model id for the
+/// `lattice-embeddings` backend (e.g. `"minilm"`, `"bge-small-en-v1.5"`).
+/// Only consulted when the `lattice-embeddings` feature is compiled in; the
+/// default build never reads it.
+pub const RUVLLM_EMBED_MODEL_ENV: &str = "RUVLLM_EMBED_MODEL";
 
 /// Result of embedding a text
 #[derive(Debug, Clone)]
@@ -131,34 +152,26 @@ impl Tokenizer {
     }
 }
 
-/// Service for text embedding with caching
-pub struct EmbeddingService {
-    /// Embedding dimension
+/// Random-init character-level embedder: matrix + sinusoidal positions +
+/// pooling. This is the original (and default) `EmbeddingService` behavior,
+/// moved verbatim into its own type so it can sit behind
+/// [`EmbeddingBackend::Random`].
+///
+/// ⚠️ **Not semantic.** The embedding matrix is initialized from uniform
+/// random noise and never trained or loaded from a checkpoint, so cosine
+/// similarity between texts does not track meaning — unrelated pairs can
+/// score higher than genuine paraphrases. Use the `lattice-embeddings`
+/// feature (see [`EmbeddingBackend::Lattice`]) for real semantic embeddings.
+struct RandomEmbedder {
     dimension: usize,
-    /// Maximum tokens
     max_tokens: usize,
-    /// Tokenizer
     tokenizer: Tokenizer,
-    /// LRU cache for embeddings
-    cache: Mutex<LruCache<u64, Embedding>>,
-    /// Embedding matrix (token_id -> embedding)
     embedding_matrix: Vec<Vec<f32>>,
-    /// Position embeddings
     position_embeddings: Vec<Vec<f32>>,
-    /// Statistics
-    stats: EmbeddingStats,
 }
 
-/// Embedding service statistics
-struct EmbeddingStats {
-    cache_hits: std::sync::atomic::AtomicU64,
-    cache_misses: std::sync::atomic::AtomicU64,
-    total_tokens: std::sync::atomic::AtomicU64,
-}
-
-impl EmbeddingService {
-    /// Create a new embedding service
-    pub fn new(config: &EmbeddingConfig) -> Result<Self> {
+impl RandomEmbedder {
+    fn new(config: &EmbeddingConfig) -> Self {
         let tokenizer = Tokenizer::new(10000);
         let vocab_size = tokenizer.vocab_size();
 
@@ -197,78 +210,34 @@ impl EmbeddingService {
             })
             .collect();
 
-        let cache_size = NonZeroUsize::new(10000).unwrap();
-
-        Ok(Self {
+        Self {
             dimension: config.dimension,
             max_tokens: config.max_tokens,
             tokenizer,
-            cache: Mutex::new(LruCache::new(cache_size)),
             embedding_matrix,
             position_embeddings,
-            stats: EmbeddingStats {
-                cache_hits: std::sync::atomic::AtomicU64::new(0),
-                cache_misses: std::sync::atomic::AtomicU64::new(0),
-                total_tokens: std::sync::atomic::AtomicU64::new(0),
-            },
-        })
+        }
     }
 
-    /// Embed a text string
-    pub fn embed(&self, text: &str) -> Result<Embedding> {
-        // Check cache
-        let hash = self.hash_text(text);
-        {
-            let mut cache = self.cache.lock();
-            if let Some(cached) = cache.get(&hash) {
-                self.stats
-                    .cache_hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut result = cached.clone();
-                result.from_cache = true;
-                return Ok(result);
-            }
-        }
-        self.stats
-            .cache_misses
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // Tokenize
+    /// Tokenize, truncate, mean-pool, and wrap into a fully-formed
+    /// `Embedding` (token/truncation bookkeeping matches this backend's own
+    /// character-level tokenizer).
+    fn embed(&self, text: &str) -> Embedding {
         let tokens = self.tokenizer.tokenize(text);
-        let token_count = tokens.len();
-        let truncated = token_count > self.max_tokens;
+        let truncated = tokens.len() > self.max_tokens;
         let tokens: Vec<u32> = tokens.into_iter().take(self.max_tokens).collect();
 
-        self.stats
-            .total_tokens
-            .fetch_add(tokens.len() as u64, std::sync::atomic::Ordering::Relaxed);
-
-        // Compute embedding
         let vector = self.compute_embedding(&tokens);
 
-        let embedding = Embedding {
+        Embedding {
             vector,
             token_count: tokens.len(),
             truncated,
             from_cache: false,
-        };
-
-        // Cache result
-        {
-            let mut cache = self.cache.lock();
-            cache.put(hash, embedding.clone());
         }
-
-        Ok(embedding)
     }
 
-    /// Embed multiple texts (batched for efficiency)
-    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Embedding>> {
-        texts.iter().map(|t| self.embed(t)).collect()
-    }
-
-    /// Embed with specific pooling strategy
-    pub fn embed_with_pooling(&self, text: &str, pooling: PoolingStrategy) -> Result<Embedding> {
+    fn embed_with_pooling(&self, text: &str, pooling: PoolingStrategy) -> Embedding {
         let tokens = self.tokenizer.tokenize(text);
         let tokens: Vec<u32> = tokens.into_iter().take(self.max_tokens).collect();
 
@@ -279,45 +248,12 @@ impl EmbeddingService {
             PoolingStrategy::LastToken => self.last_token_pooling(&tokens),
         };
 
-        Ok(Embedding {
+        Embedding {
             vector,
             token_count: tokens.len(),
             truncated: tokens.len() >= self.max_tokens,
             from_cache: false,
-        })
-    }
-
-    /// Get embedding statistics
-    pub fn get_stats(&self) -> EmbeddingServiceStats {
-        EmbeddingServiceStats {
-            cache_hits: self
-                .stats
-                .cache_hits
-                .load(std::sync::atomic::Ordering::Relaxed),
-            cache_misses: self
-                .stats
-                .cache_misses
-                .load(std::sync::atomic::Ordering::Relaxed),
-            total_tokens: self
-                .stats
-                .total_tokens
-                .load(std::sync::atomic::Ordering::Relaxed),
-            cache_size: self.cache.lock().len(),
         }
-    }
-
-    /// Clear the embedding cache
-    pub fn clear_cache(&self) {
-        self.cache.lock().clear();
-    }
-
-    fn hash_text(&self, text: &str) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        hasher.finish()
     }
 
     fn compute_embedding(&self, tokens: &[u32]) -> Vec<f32> {
@@ -433,6 +369,248 @@ impl EmbeddingService {
     }
 }
 
+/// The backend actually used to compute embedding vectors.
+enum EmbeddingBackend {
+    /// Random-init character-level matrix (default; not semantic — see
+    /// [`RandomEmbedder`]'s docs).
+    Random(RandomEmbedder),
+    /// Real pretrained sentence embeddings via `lattice-embed`, through
+    /// [`ruvector_core::embeddings::LatticeEmbedding`]. Selected at runtime
+    /// when a model id is requested (config field or
+    /// [`RUVLLM_EMBED_MODEL_ENV`]); never enabled implicitly.
+    #[cfg(feature = "lattice-embeddings")]
+    Lattice(LatticeEmbedding),
+}
+
+impl EmbeddingBackend {
+    /// Human-readable backend label for [`EmbeddingServiceStats::backend`]
+    /// (e.g. `"random-charlevel"` / `"lattice:bge-small-en-v1.5"`).
+    fn label(&self) -> String {
+        match self {
+            EmbeddingBackend::Random(_) => "random-charlevel".to_string(),
+            #[cfg(feature = "lattice-embeddings")]
+            EmbeddingBackend::Lattice(l) => format!("lattice:{}", l.name()),
+        }
+    }
+
+    fn is_pretrained(&self) -> bool {
+        match self {
+            EmbeddingBackend::Random(_) => false,
+            #[cfg(feature = "lattice-embeddings")]
+            EmbeddingBackend::Lattice(_) => true,
+        }
+    }
+}
+
+/// Service for text embedding with caching
+pub struct EmbeddingService {
+    /// Embedding dimension actually produced by the active backend (may
+    /// differ from `config.dimension` when a pretrained model is loaded —
+    /// e.g. bge-small is 384D regardless of what `config.dimension` requested).
+    dimension: usize,
+    /// LRU cache for embeddings
+    cache: Mutex<LruCache<u64, Embedding>>,
+    /// Active embedding backend
+    backend: EmbeddingBackend,
+    /// Statistics
+    stats: EmbeddingStats,
+}
+
+/// Embedding service statistics
+struct EmbeddingStats {
+    cache_hits: std::sync::atomic::AtomicU64,
+    cache_misses: std::sync::atomic::AtomicU64,
+    total_tokens: std::sync::atomic::AtomicU64,
+}
+
+impl EmbeddingService {
+    /// Create a new embedding service.
+    ///
+    /// By default this builds the random-init character-level backend
+    /// (`EmbeddingBackend::Random`) — fast, no download, but not semantic.
+    ///
+    /// A real pretrained backend can be selected at runtime by requesting a
+    /// model id via the `RUVLLM_EMBED_MODEL` environment variable (e.g.
+    /// `"minilm"`, `"bge-small-en-v1.5"`) **and** compiling with the
+    /// `lattice-embeddings` feature. If a model is requested but the feature
+    /// is not compiled in, or the feature is compiled in but the requested
+    /// model fails to load (bad id, network/download failure), this returns
+    /// an error rather than silently falling back to the random backend — an
+    /// explicitly-requested pretrained model that can't load is a real
+    /// failure.
+    pub fn new(config: &EmbeddingConfig) -> Result<Self> {
+        let requested_model = std::env::var(RUVLLM_EMBED_MODEL_ENV).ok();
+
+        let backend = match requested_model {
+            Some(model_id) if !model_id.trim().is_empty() => {
+                Self::load_lattice_backend(&model_id)?
+            }
+            _ => EmbeddingBackend::Random(RandomEmbedder::new(config)),
+        };
+
+        let dimension = match &backend {
+            EmbeddingBackend::Random(_) => config.dimension,
+            #[cfg(feature = "lattice-embeddings")]
+            EmbeddingBackend::Lattice(l) => l.dimensions(),
+        };
+
+        let cache_size = NonZeroUsize::new(10000).unwrap();
+
+        Ok(Self {
+            dimension,
+            cache: Mutex::new(LruCache::new(cache_size)),
+            backend,
+            stats: EmbeddingStats {
+                cache_hits: std::sync::atomic::AtomicU64::new(0),
+                cache_misses: std::sync::atomic::AtomicU64::new(0),
+                total_tokens: std::sync::atomic::AtomicU64::new(0),
+            },
+        })
+    }
+
+    #[cfg(feature = "lattice-embeddings")]
+    fn load_lattice_backend(model_id: &str) -> Result<EmbeddingBackend> {
+        let provider = LatticeEmbedding::from_pretrained(model_id).map_err(|e| {
+            Error::Embedding(format!(
+                "requested pretrained model '{model_id}' via {RUVLLM_EMBED_MODEL_ENV} \
+                 failed to load: {e}"
+            ))
+        })?;
+        Ok(EmbeddingBackend::Lattice(provider))
+    }
+
+    #[cfg(not(feature = "lattice-embeddings"))]
+    fn load_lattice_backend(model_id: &str) -> Result<EmbeddingBackend> {
+        Err(Error::Embedding(format!(
+            "pretrained model '{model_id}' requested via {RUVLLM_EMBED_MODEL_ENV}, but this \
+             build was compiled without the `lattice-embeddings` feature. Rebuild with \
+             `--features lattice-embeddings` to use a pretrained backend, or unset \
+             {RUVLLM_EMBED_MODEL_ENV} to use the default random backend."
+        )))
+    }
+
+    /// Embed a text string
+    pub fn embed(&self, text: &str) -> Result<Embedding> {
+        // Check cache
+        let hash = self.hash_text(text);
+        {
+            let mut cache = self.cache.lock();
+            if let Some(cached) = cache.get(&hash) {
+                self.stats
+                    .cache_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut result = cached.clone();
+                result.from_cache = true;
+                return Ok(result);
+            }
+        }
+        self.stats
+            .cache_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let embedding = match &self.backend {
+            EmbeddingBackend::Random(random) => random.embed(text),
+            #[cfg(feature = "lattice-embeddings")]
+            EmbeddingBackend::Lattice(lattice) => {
+                // Symmetric STS/similarity usage: always the passage side.
+                // `EmbeddingProvider::embed` never applies a query
+                // instruction (see `LatticeEmbedding`'s docs) — callers that
+                // need asymmetric query/passage retrieval should use
+                // `LatticeEmbedding::embed_query` directly, which this napi
+                // surface does not expose.
+                let vector = lattice
+                    .embed(text)
+                    .map_err(|e| Error::Embedding(format!("lattice-embed inference failed: {e}")))?;
+                Embedding {
+                    vector,
+                    // Informational only: the pretrained backend uses its
+                    // own subword tokenizer internally, not the char-level
+                    // `Tokenizer` above.
+                    token_count: text.split_whitespace().count(),
+                    truncated: false,
+                    from_cache: false,
+                }
+            }
+        };
+
+        self.stats
+            .total_tokens
+            .fetch_add(embedding.token_count as u64, std::sync::atomic::Ordering::Relaxed);
+
+        // Cache result
+        {
+            let mut cache = self.cache.lock();
+            cache.put(hash, embedding.clone());
+        }
+
+        Ok(embedding)
+    }
+
+    /// Embed multiple texts (batched for efficiency)
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Embedding>> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
+
+    /// Embed with specific pooling strategy.
+    ///
+    /// Pooling strategies (mean/max/CLS/last-token) are a property of the
+    /// `Random` backend's own token+position matrices. The `Lattice` backend
+    /// performs its own pooling internally (mean-pooling over the
+    /// transformer's hidden states, L2-normalized) and has no separate
+    /// per-strategy output, so on that backend this ignores `pooling` and
+    /// returns the same vector as [`EmbeddingService::embed`].
+    pub fn embed_with_pooling(&self, text: &str, pooling: PoolingStrategy) -> Result<Embedding> {
+        match &self.backend {
+            EmbeddingBackend::Random(random) => Ok(random.embed_with_pooling(text, pooling)),
+            #[cfg(feature = "lattice-embeddings")]
+            EmbeddingBackend::Lattice(_) => self.embed(text),
+        }
+    }
+
+    /// Effective embedding dimension of the active backend. Matches
+    /// `config.dimension` on the default random backend; may differ from it
+    /// on the `lattice-embeddings` backend, where the loaded pretrained
+    /// model's own dimensionality wins (e.g. bge-small is always 384D).
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Get embedding statistics
+    pub fn get_stats(&self) -> EmbeddingServiceStats {
+        EmbeddingServiceStats {
+            cache_hits: self
+                .stats
+                .cache_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            cache_misses: self
+                .stats
+                .cache_misses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_tokens: self
+                .stats
+                .total_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            cache_size: self.cache.lock().len(),
+            backend: self.backend.label(),
+            pretrained: self.backend.is_pretrained(),
+        }
+    }
+
+    /// Clear the embedding cache
+    pub fn clear_cache(&self) {
+        self.cache.lock().clear();
+    }
+
+    fn hash_text(&self, text: &str) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 /// Pooling strategy for embeddings
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolingStrategy {
@@ -457,6 +635,13 @@ pub struct EmbeddingServiceStats {
     pub total_tokens: u64,
     /// Current cache size
     pub cache_size: usize,
+    /// Active backend label, e.g. `"random-charlevel"` or
+    /// `"lattice:bge-small-en-v1.5"`. Lets a caller distinguish the
+    /// non-semantic default from a loaded pretrained model.
+    pub backend: String,
+    /// Whether the active backend is a real pretrained model (`true`) or
+    /// the random-init default (`false`).
+    pub pretrained: bool,
 }
 
 #[cfg(test)]
@@ -584,6 +769,8 @@ mod tests {
         let stats = service.get_stats();
         assert_eq!(stats.cache_hits, 1);
         assert_eq!(stats.cache_misses, 2);
+        assert_eq!(stats.backend, "random-charlevel");
+        assert!(!stats.pretrained);
     }
 
     #[test]
@@ -608,5 +795,145 @@ mod tests {
 
         service.clear_cache();
         assert_eq!(service.get_stats().cache_size, 0);
+    }
+
+}
+
+/// Discrimination regression test (issue #655, ask #2): asserts that every
+/// paraphrase pair scores a higher cosine similarity than every unrelated
+/// pair.
+///
+/// Gated `#[ignore]` unconditionally: it downloads a pretrained model over
+/// the network on first run, so it must never fire from a plain `cargo
+/// test`. Compiles in both the default and `lattice-embeddings` builds (it
+/// only touches the public `EmbeddingService` API), but can only actually
+/// pass in the `lattice-embeddings` build — without that feature,
+/// `EmbeddingService::new` fails fast (see
+/// `EmbeddingService::load_lattice_backend`) because a model was
+/// explicitly requested. This is the mutation-sensitivity property required
+/// by #655 ask #2: the assertion fails against the random backend (verified
+/// manually against `RandomEmbedder` during development — see the PR
+/// description for the observed before/after cosine tables) and passes only
+/// once real pretrained embeddings are wired in.
+///
+/// Run with: `RUVLLM_EMBED_MODEL=minilm cargo test --features
+/// lattice-embeddings -- --ignored discriminat`
+#[cfg(test)]
+mod discrimination {
+    use super::*;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm_a == 0.0 || norm_b == 0.0 {
+            0.0
+        } else {
+            dot / (norm_a * norm_b)
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the lattice-embeddings feature and downloads a model over the \
+                network; run: RUVLLM_EMBED_MODEL=minilm cargo test --features \
+                lattice-embeddings -- --ignored discriminat"]
+    fn lattice_embeddings_discriminate() {
+        let model_id =
+            std::env::var(RUVLLM_EMBED_MODEL_ENV).unwrap_or_else(|_| "minilm".to_string());
+        // SAFETY: single-threaded test process (this test is `--ignored`,
+        // always run in isolation), no concurrent env access.
+        unsafe {
+            std::env::set_var(RUVLLM_EMBED_MODEL_ENV, &model_id);
+        }
+
+        let config = EmbeddingConfig::default();
+        let service = EmbeddingService::new(&config)
+            .unwrap_or_else(|e| panic!("failed to load pretrained model '{model_id}': {e}"));
+        assert!(
+            service.get_stats().pretrained,
+            "service must report pretrained=true once a real model is loaded"
+        );
+
+        // (text, paraphrase, unrelated)
+        let corpus: [(&str, &str, &str); 6] = [
+            (
+                "The cat sat on the mat.",
+                "A cat was sitting on the rug.",
+                "The stock market crashed yesterday.",
+            ),
+            (
+                "How do I reset my password?",
+                "What is the process to change my login password?",
+                "The recipe calls for two cups of flour.",
+            ),
+            (
+                "The weather today is sunny and warm.",
+                "It's a bright, warm day outside.",
+                "The quarterly earnings report was released.",
+            ),
+            (
+                "She enjoys playing the piano in the evening.",
+                "In the evenings she likes to play piano.",
+                "The bridge was constructed in 1932.",
+            ),
+            (
+                "The car broke down on the highway.",
+                "The vehicle stalled on the freeway.",
+                "He studied biology at the university.",
+            ),
+            (
+                "Machine learning models require large datasets.",
+                "Training ML models needs a lot of data.",
+                "The garden was full of blooming roses.",
+            ),
+        ];
+
+        let mut paraphrase_scores = Vec::with_capacity(corpus.len());
+        let mut unrelated_scores = Vec::with_capacity(corpus.len());
+        let mut table = String::new();
+        table.push_str("text | paraphrase_sim | unrelated_sim\n");
+
+        for (text, paraphrase, unrelated) in corpus {
+            let e_text = service.embed(text).unwrap();
+            let e_paraphrase = service.embed(paraphrase).unwrap();
+            let e_unrelated = service.embed(unrelated).unwrap();
+
+            let sim_paraphrase = cosine(&e_text.vector, &e_paraphrase.vector);
+            let sim_unrelated = cosine(&e_text.vector, &e_unrelated.vector);
+
+            table.push_str(&format!(
+                "{text:?} | {sim_paraphrase:.4} | {sim_unrelated:.4}\n"
+            ));
+
+            paraphrase_scores.push(sim_paraphrase);
+            unrelated_scores.push(sim_unrelated);
+        }
+
+        println!("model={model_id}\n{table}");
+
+        let min_paraphrase = paraphrase_scores
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let max_unrelated = unrelated_scores
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        println!(
+            "min(paraphrase_sim)={min_paraphrase:.4} max(unrelated_sim)={max_unrelated:.4}"
+        );
+
+        for (i, (&p, &u)) in paraphrase_scores.iter().zip(unrelated_scores.iter()).enumerate() {
+            assert!(
+                p > u,
+                "pair {i}: paraphrase similarity ({p:.4}) must exceed unrelated similarity ({u:.4})"
+            );
+        }
+
+        assert!(
+            min_paraphrase > max_unrelated,
+            "min(paraphrase_sim)={min_paraphrase:.4} must exceed max(unrelated_sim)={max_unrelated:.4}"
+        );
     }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@ruvector/rvf",
-  "version": "0.2.3",
+  "version": "0.3.1",
   "description": "RuVector Format — unified TypeScript SDK for vector intelligence",
   "main": "dist/index.js",
   "module": "dist/index.js",

@@ -122,6 +122,7 @@ pub struct MmapManager {
     /// Mutable memory mapping
     mmap: MmapMut,
     /// Operating system page size
+    #[allow(dead_code)]
     page_size: usize,
     /// Embedding dimension
     d_embed: usize,

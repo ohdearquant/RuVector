@@ -15,13 +15,23 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 }) : function(o, v) {
     o["default"] = v;
 });
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.WasmBackend = exports.NodeBackend = void 0;
 exports.resolveBackend = resolveBackend;
@@ -67,6 +77,22 @@ class NodeBackend {
             throw new errors_1.RvfError(errors_1.RvfErrorCode.StoreClosed);
         }
     }
+    /** Release a native handle without persisting mappings after open failed. */
+    discardHandle() {
+        try {
+            this.handle?.close();
+        }
+        catch {
+            // Preserve the original open/sidecar error.
+        }
+        finally {
+            this.handle = null;
+            this.storePath = '';
+            this.idToLabel.clear();
+            this.labelToId.clear();
+            this.nextLabel = 1;
+        }
+    }
     async create(path, options) {
         await this.loadNative();
         try {
@@ -88,6 +114,7 @@ class NodeBackend {
             await this.loadMappings();
         }
         catch (err) {
+            this.discardHandle();
             throw errors_1.RvfError.fromNative(err);
         }
     }
@@ -99,12 +126,14 @@ class NodeBackend {
             await this.loadMappings();
         }
         catch (err) {
+            this.discardHandle();
             throw errors_1.RvfError.fromNative(err);
         }
     }
     async ingestBatch(entries) {
         this.ensureHandle();
         try {
+            rejectUnsupportedMetadata(entries);
             // NAPI signature: ingestBatch(vectors: Float32Array, ids: i64[], metadata?)
             // Flatten individual vectors into a single contiguous Float32Array.
             const n = entries.length;
@@ -215,12 +244,18 @@ class NodeBackend {
     async close() {
         if (!this.handle)
             return;
+        let failure;
         try {
             await this.saveMappings();
+        }
+        catch (err) {
+            failure = err;
+        }
+        try {
             this.handle.close();
         }
         catch (err) {
-            throw errors_1.RvfError.fromNative(err);
+            failure ?? (failure = err);
         }
         finally {
             this.handle = null;
@@ -229,6 +264,8 @@ class NodeBackend {
             this.nextLabel = 1;
             this.storePath = '';
         }
+        if (failure)
+            throw errors_1.RvfError.fromNative(failure);
     }
     async fileId() {
         this.ensureHandle();
@@ -349,6 +386,12 @@ class NodeBackend {
             throw errors_1.RvfError.fromNative(err);
         }
     }
+    async exportBytes() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'exportBytes is not supported by the node backend — use a file path with create()/open() instead');
+    }
+    async openBytes(_bytes) {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'openBytes is not supported by the node backend — use a file path with open() instead');
+    }
     // ─── String ID ↔ Numeric Label mapping helpers ───
     /**
      * Get or allocate a numeric label for a string ID.
@@ -387,7 +430,10 @@ class NodeBackend {
             labelToId: Object.fromEntries(Array.from(this.labelToId.entries()).map(([k, v]) => [String(k), v])),
             nextLabel: this.nextLabel,
         });
-        const tmp = `${mp}.tmp`;
+        // A shared `${mp}.tmp` races across processes opening the same store.
+        // Synchronous writes cannot interleave within one Node process; PID plus
+        // timestamp also keeps independently-running writers on separate paths.
+        const tmp = `${mp}.${process.pid}.${Date.now()}.tmp`;
         try {
             fs.writeFileSync(tmp, data, 'utf-8');
             fs.renameSync(tmp, mp);
@@ -421,10 +467,55 @@ class NodeBackend {
             return; // fresh store: no sidecar yet is legitimate
         let parsed;
         try {
-            parsed = JSON.parse(fs.readFileSync(mp, 'utf-8'));
+            const candidate = JSON.parse(fs.readFileSync(mp, 'utf-8'));
+            if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+                throw new TypeError('sidecar root must be an object');
+            }
+            const raw = candidate;
+            if (!raw.idToLabel ||
+                typeof raw.idToLabel !== 'object' ||
+                Array.isArray(raw.idToLabel) ||
+                !raw.labelToId ||
+                typeof raw.labelToId !== 'object' ||
+                Array.isArray(raw.labelToId) ||
+                !Number.isSafeInteger(raw.nextLabel) ||
+                raw.nextLabel < 1) {
+                throw new TypeError('sidecar must contain idToLabel, labelToId, and a positive nextLabel');
+            }
+            const idToLabel = raw.idToLabel;
+            const labelToId = raw.labelToId;
+            let maxLabel = 0;
+            for (const [id, label] of Object.entries(idToLabel)) {
+                if (!Number.isSafeInteger(label) || label < 1) {
+                    throw new TypeError(`invalid label for id ${JSON.stringify(id)}`);
+                }
+                if (labelToId[String(label)] !== id) {
+                    throw new TypeError(`idToLabel/labelToId mismatch for id ${JSON.stringify(id)}`);
+                }
+                maxLabel = Math.max(maxLabel, label);
+            }
+            for (const [label, id] of Object.entries(labelToId)) {
+                const numericLabel = Number(label);
+                if (!Number.isSafeInteger(numericLabel) ||
+                    numericLabel < 1 ||
+                    String(numericLabel) !== label ||
+                    typeof id !== 'string' ||
+                    idToLabel[id] !== numericLabel) {
+                    throw new TypeError(`invalid reverse mapping for label ${JSON.stringify(label)}`);
+                }
+            }
+            if (raw.nextLabel <= maxLabel) {
+                throw new TypeError('nextLabel must be greater than every allocated label');
+            }
+            parsed = {
+                idToLabel: idToLabel,
+                labelToId: labelToId,
+                nextLabel: raw.nextLabel,
+            };
         }
         catch (err) {
-            const quarantine = `${mp}.corrupt-${Date.now()}`;
+            const { randomUUID } = await Promise.resolve().then(() => __importStar(require('crypto')));
+            const quarantine = `${mp}.corrupt-${Date.now()}-${randomUUID()}`;
             try {
                 fs.renameSync(mp, quarantine);
             }
@@ -435,9 +526,9 @@ class NodeBackend {
                 `silently corrupt data — restore a valid sidecar or recreate the store; ` +
                 `${err instanceof Error ? err.message : String(err)}`);
         }
-        this.idToLabel = new Map(Object.entries(parsed.idToLabel ?? {}).map(([k, v]) => [k, Number(v)]));
-        this.labelToId = new Map(Object.entries(parsed.labelToId ?? {}).map(([k, v]) => [Number(k), v]));
-        this.nextLabel = parsed.nextLabel ?? this.idToLabel.size + 1;
+        this.idToLabel = new Map(Object.entries(parsed.idToLabel));
+        this.labelToId = new Map(Object.entries(parsed.labelToId).map(([k, v]) => [Number(k), v]));
+        this.nextLabel = parsed.nextLabel;
     }
 }
 exports.NodeBackend = NodeBackend;
@@ -515,6 +606,7 @@ class WasmBackend {
     async ingestBatch(entries) {
         this.ensureHandle();
         try {
+            rejectUnsupportedMetadata(entries);
             const n = entries.length;
             if (n === 0)
                 return { accepted: 0, rejected: 0, epoch: 0 };
@@ -658,6 +750,57 @@ class WasmBackend {
             throw new errors_1.RvfError(errors_1.RvfErrorCode.StoreClosed);
         return d;
     }
+    /**
+     * Serialize the in-memory store to `.rvf` bytes via the `rvf_store_export`
+     * C-ABI export. `rvf_store_export` follows a probe-then-write pattern:
+     * called with a too-small (or zero-length) buffer it returns the negated
+     * required size, so we probe first, allocate exactly that much, then
+     * write for real.
+     */
+    async exportBytes() {
+        this.ensureHandle();
+        try {
+            const probe = this.wasm.rvf_store_export(this.handle, 0, 0);
+            const size = probe < 0 ? -probe : probe;
+            if (size <= 0)
+                return new Uint8Array(0);
+            const ptr = this.wasm.rvf_alloc(size);
+            try {
+                const written = this.wasm.rvf_store_export(this.handle, ptr, size);
+                if (written < 0) {
+                    throw new Error(`rvf_store_export failed after size probe (size=${size})`);
+                }
+                return new Uint8Array(this.wasm.memory.buffer, ptr, written).slice();
+            }
+            finally {
+                this.wasm.rvf_free(ptr, size);
+            }
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    /** Load a store from `.rvf` bytes via the `rvf_store_open` C-ABI import. */
+    async openBytes(bytes) {
+        await this.loadWasm();
+        try {
+            const ptr = this.wasm.rvf_alloc(bytes.byteLength);
+            try {
+                new Uint8Array(this.wasm.memory.buffer, ptr, bytes.byteLength).set(bytes);
+                const h = this.wasm.rvf_store_open(ptr, bytes.byteLength);
+                if (h <= 0)
+                    throw new Error('rvf_store_open returned ' + h);
+                this.handle = h;
+                this.dim = this.wasm.rvf_store_dimension(h);
+            }
+            finally {
+                this.wasm.rvf_free(ptr, bytes.byteLength);
+            }
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
 }
 exports.WasmBackend = WasmBackend;
 // ---------------------------------------------------------------------------
@@ -742,9 +885,87 @@ function mapQueryOptionsToNative(options) {
     return {
         ef_search: options.efSearch ?? 100,
         // NAPI accepts the filter as a JSON string, not an object.
-        filter: options.filter ? JSON.stringify(options.filter) : undefined,
+        filter: options.filter ? JSON.stringify(filterToNativeJson(options.filter)) : undefined,
         timeout_ms: options.timeoutMs ?? 0,
     };
+}
+/**
+ * Infer the native `valueType` ("u64" | "i64" | "f64" | "string" | "bool")
+ * from a JS filter value and stringify it, matching what the N-API filter
+ * parser requires (`crates/rvf/rvf-node/src/lib.rs::parse_filter_value`).
+ * The public `RvfFilterExpr` type deliberately omits `valueType` — the SDK
+ * infers it here so callers don't have to know the native wire format
+ * (issue #704: the SDK previously omitted `valueType` entirely, which the
+ * native parser requires and rejects).
+ */
+function filterValueToNative(value) {
+    if (typeof value === 'boolean') {
+        return { valueType: 'bool', value: value ? 'true' : 'false' };
+    }
+    if (typeof value === 'string') {
+        return { valueType: 'string', value };
+    }
+    // number: integers map to u64/i64 (native has no single "number" type),
+    // non-integers map to f64.
+    if (!Number.isInteger(value)) {
+        return { valueType: 'f64', value: String(value) };
+    }
+    return { valueType: value >= 0 ? 'u64' : 'i64', value: String(value) };
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function filterToNativeJson(expr) {
+    switch (expr.op) {
+        case 'eq':
+        case 'ne':
+        case 'lt':
+        case 'le':
+        case 'gt':
+        case 'ge': {
+            const { valueType, value } = filterValueToNative(expr.value);
+            return { op: expr.op, fieldId: expr.fieldId, valueType, value };
+        }
+        case 'in': {
+            // valueType must be uniform across all values for a single 'in' filter.
+            const converted = expr.values.map(filterValueToNative);
+            const valueType = converted[0]?.valueType ?? 'string';
+            return {
+                op: 'in',
+                fieldId: expr.fieldId,
+                valueType,
+                values: converted.map((c) => c.value),
+            };
+        }
+        case 'range': {
+            const lo = filterValueToNative(expr.low);
+            const hi = filterValueToNative(expr.high);
+            return {
+                op: 'range',
+                fieldId: expr.fieldId,
+                valueType: lo.valueType,
+                low: lo.value,
+                high: hi.value,
+            };
+        }
+        case 'and':
+            return { op: 'and', children: expr.exprs.map(filterToNativeJson) };
+        case 'or':
+            return { op: 'or', children: expr.exprs.map(filterToNativeJson) };
+        case 'not':
+            return { op: 'not', child: filterToNativeJson(expr.expr) };
+    }
+}
+/**
+ * Immediate safety measure for issue #704: the SDK does not yet have a
+ * design for mapping arbitrary string metadata field names to the native
+ * layer's numeric `fieldId` + typed `value`, so silently accepting
+ * `RvfIngestEntry.metadata` would silently drop it (the original bug).
+ * Reject loudly instead until metadata ingestion is implemented.
+ */
+function rejectUnsupportedMetadata(entries) {
+    const hasMetadata = entries.some((e) => e.metadata && Object.keys(e.metadata).length > 0);
+    if (hasMetadata) {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.MetadataNotSupported);
+    }
 }
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function mapNativeStatus(s) {

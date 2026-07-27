@@ -51,7 +51,8 @@ var RvfErrorCode;
     RvfErrorCode[RvfErrorCode["BackendInitFailed"] = 65281] = "BackendInitFailed";
     RvfErrorCode[RvfErrorCode["StoreClosed"] = 65282] = "StoreClosed";
     RvfErrorCode[RvfErrorCode["InvalidOptions"] = 65283] = "InvalidOptions";
-    // (0xff04–0xff05 reserved)
+    RvfErrorCode[RvfErrorCode["MetadataNotSupported"] = 65284] = "MetadataNotSupported";
+    // 0xff05 reserved
     RvfErrorCode[RvfErrorCode["SidecarWriteFailed"] = 65286] = "SidecarWriteFailed";
     RvfErrorCode[RvfErrorCode["SidecarCorrupt"] = 65287] = "SidecarCorrupt";
 })(RvfErrorCode || (exports.RvfErrorCode = RvfErrorCode = {}));
@@ -93,6 +94,8 @@ const ERROR_MESSAGES = {
     [RvfErrorCode.BackendInitFailed]: 'Backend initialization failed',
     [RvfErrorCode.StoreClosed]: 'Store has been closed',
     [RvfErrorCode.InvalidOptions]: 'Invalid store creation options',
+    [RvfErrorCode.MetadataNotSupported]: 'Per-vector metadata is not yet supported by this SDK (see issue #704) — ' +
+        'ingest without a metadata field, or wait for durable metadata support',
     [RvfErrorCode.SidecarWriteFailed]: 'Failed to persist the string-id map sidecar',
     [RvfErrorCode.SidecarCorrupt]: 'The string-id map sidecar is missing fields or corrupt',
 };

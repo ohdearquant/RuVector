@@ -2,51 +2,175 @@
 //!
 //! Dispatch priority: GPU (if `gpu` feature) → SimSIMD (if `simd` feature) → scalar
 
-/// Flat vector storage — contiguous memory for cache-friendly access
-/// Vectors are stored as a single `Vec<f32>` slab: `[v0_d0, v0_d1, ..., v1_d0, ...]`
-#[derive(Clone)]
+use crate::error::{DiskAnnError, Result};
+use memmap2::Mmap;
+
+/// Backing storage for the flat vector slab.
+///
+/// `Owned` is heap-resident — used while inserting/building, and by
+/// [`FlatVectors::from_owned`] (the default, back-compat `load()` path).
+/// `Mmap` is read-through: vector slices are read directly out of the mapped file
+/// on each [`FlatVectors::get`] call, so RSS stays proportional to the accessed
+/// working set instead of the whole dataset (see #674). It is populated only via
+/// [`FlatVectors::from_mmap`], which validates 4-byte alignment up front so `get`
+/// never has to fall back to an unaligned-read fail path per call.
+enum VectorStorage {
+    Owned(Vec<f32>),
+    Mmap { mmap: Mmap, data_offset: usize },
+}
+
+/// Flat vector storage — contiguous memory for cache-friendly access.
+/// Vectors are logically a single slab: `[v0_d0, v0_d1, ..., v1_d0, ...]`, either
+/// owned in RAM or read straight out of a memory-mapped file.
 pub struct FlatVectors {
-    pub data: Vec<f32>,
+    storage: VectorStorage,
     pub dim: usize,
     pub count: usize,
+    /// Post-load tombstones for mmap-backed storage. The mapped file is never
+    /// mutated, so deletes on read-through storage are tracked in this owned
+    /// overlay instead of the in-place NaN write `Owned` storage uses. Empty (and
+    /// unused) for `Owned` storage, which keeps the original NaN-write behavior.
+    tombstones: Vec<bool>,
+    /// Shared all-NaN row returned by `get()` for a tombstoned mmap index — same
+    /// externally observable shape as the NaN vector `Owned::zero_out` produces.
+    tombstone_row: Vec<f32>,
 }
 
 impl FlatVectors {
     pub fn new(dim: usize) -> Self {
         Self {
-            data: Vec::new(),
+            storage: VectorStorage::Owned(Vec::new()),
             dim,
             count: 0,
+            tombstones: Vec::new(),
+            tombstone_row: vec![f32::NAN; dim],
         }
     }
 
     pub fn with_capacity(dim: usize, n: usize) -> Self {
         Self {
-            data: Vec::with_capacity(n * dim),
+            storage: VectorStorage::Owned(Vec::with_capacity(n * dim)),
             dim,
             count: 0,
+            tombstones: Vec::new(),
+            tombstone_row: vec![f32::NAN; dim],
+        }
+    }
+
+    /// Build owned flat storage directly from an already-materialized slab (e.g.
+    /// copied out of a save file's mmap). `data.len()` must equal `count * dim`.
+    pub fn from_owned(data: Vec<f32>, dim: usize, count: usize) -> Self {
+        debug_assert_eq!(data.len(), count * dim);
+        Self {
+            storage: VectorStorage::Owned(data),
+            dim,
+            count,
+            tombstones: Vec::new(),
+            tombstone_row: vec![f32::NAN; dim],
+        }
+    }
+
+    /// Build a read-through view directly over a memory-mapped file's flat f32
+    /// slab, starting `data_offset` bytes into the map.
+    ///
+    /// Fails closed (returns `Err`, never transmutes) if the slab's start isn't
+    /// 4-byte aligned — required to reinterpret mapped bytes as `f32` without UB —
+    /// or if the map is too short for `count * dim` floats.
+    pub fn from_mmap(mmap: Mmap, data_offset: usize, dim: usize, count: usize) -> Result<Self> {
+        let base = mmap.as_ptr() as usize;
+        if base.wrapping_add(data_offset) % std::mem::align_of::<f32>() != 0 {
+            return Err(DiskAnnError::InvalidConfig(format!(
+                "mmap vector data at offset {data_offset} is not 4-byte aligned (mmap base 0x{base:x}); refusing to cast unaligned bytes to f32"
+            )));
+        }
+        let need_bytes = count
+            .checked_mul(dim)
+            .and_then(|floats| floats.checked_mul(4))
+            .and_then(|bytes| bytes.checked_add(data_offset))
+            .ok_or_else(|| {
+                DiskAnnError::InvalidConfig("vector slab size overflowed usize".to_string())
+            })?;
+        if mmap.len() < need_bytes {
+            return Err(DiskAnnError::InvalidConfig(format!(
+                "mmap too short for {count} vectors of dim {dim}: need {need_bytes} bytes, have {}",
+                mmap.len()
+            )));
+        }
+        Ok(Self {
+            storage: VectorStorage::Mmap { mmap, data_offset },
+            dim,
+            count,
+            tombstones: vec![false; count],
+            tombstone_row: vec![f32::NAN; dim],
+        })
+    }
+
+    /// Whether this instance is backed by a read-through mmap (vs. owned RAM).
+    pub fn is_mmap_backed(&self) -> bool {
+        matches!(self.storage, VectorStorage::Mmap { .. })
+    }
+
+    /// Zero-copy byte view of the flat slab, when it is owned in RAM. `None` for
+    /// mmap-backed storage — callers needing bytes there should read per-vector via
+    /// [`FlatVectors::get`] instead of assuming one contiguous owned buffer.
+    pub fn as_owned_slice(&self) -> Option<&[f32]> {
+        match &self.storage {
+            VectorStorage::Owned(data) => Some(data),
+            VectorStorage::Mmap { .. } => None,
         }
     }
 
     #[inline]
     pub fn push(&mut self, vector: &[f32]) {
         debug_assert_eq!(vector.len(), self.dim);
-        self.data.extend_from_slice(vector);
-        self.count += 1;
+        match &mut self.storage {
+            VectorStorage::Owned(data) => {
+                data.extend_from_slice(vector);
+                self.count += 1;
+            }
+            VectorStorage::Mmap { .. } => {
+                panic!(
+                    "FlatVectors::push called on mmap-backed (read-through) storage — mmap-loaded indexes are read-only for inserts; callers must check is_mmap_backed() first"
+                );
+            }
+        }
     }
 
     #[inline]
     pub fn get(&self, idx: usize) -> &[f32] {
-        let start = idx * self.dim;
-        &self.data[start..start + self.dim]
+        match &self.storage {
+            VectorStorage::Owned(data) => {
+                let start = idx * self.dim;
+                &data[start..start + self.dim]
+            }
+            VectorStorage::Mmap { mmap, data_offset } => {
+                if self.tombstones.get(idx).copied().unwrap_or(false) {
+                    return &self.tombstone_row;
+                }
+                let start = data_offset + idx * self.dim * 4;
+                let byte_slice = &mmap[start..start + self.dim * 4];
+                bytemuck::cast_slice(byte_slice)
+            }
+        }
     }
 
-    /// Zero out a vector (lazy deletion)
+    /// Zero out a vector (lazy deletion). Owned storage keeps writing NaN in place
+    /// (unchanged, zero extra cost); mmap storage sets a tombstone flag instead of
+    /// mutating the mapped file — both are observed identically through `get()`.
     #[inline]
     pub fn zero_out(&mut self, idx: usize) {
-        let start = idx * self.dim;
-        for v in &mut self.data[start..start + self.dim] {
-            *v = f32::NAN;
+        match &mut self.storage {
+            VectorStorage::Owned(data) => {
+                let start = idx * self.dim;
+                for v in &mut data[start..start + self.dim] {
+                    *v = f32::NAN;
+                }
+            }
+            VectorStorage::Mmap { .. } => {
+                if let Some(flag) = self.tombstones.get_mut(idx) {
+                    *flag = true;
+                }
+            }
         }
     }
 
@@ -327,6 +451,86 @@ mod tests {
         assert_eq!(fv.len(), 2);
         assert_eq!(fv.get(0), &[1.0, 2.0, 3.0]);
         assert_eq!(fv.get(1), &[4.0, 5.0, 6.0]);
+        assert!(!fv.is_mmap_backed());
+    }
+
+    /// Write a `vectors.bin`-shaped file (8-byte n, 8-byte dim, then flat
+    /// little-endian f32 data) and mmap it — the same layout `index.rs` produces.
+    fn mmap_fixture(data: &[f32], dim: usize, count: usize) -> memmap2::Mmap {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&(count as u64).to_le_bytes()).unwrap();
+        tmp.write_all(&(dim as u64).to_le_bytes()).unwrap();
+        for &v in data {
+            tmp.write_all(&v.to_le_bytes()).unwrap();
+        }
+        tmp.flush().unwrap();
+        let file = std::fs::File::open(tmp.path()).unwrap();
+        // Leak the tempfile handle for the test's duration — NamedTempFile deletes
+        // on drop, but the mmap needs the backing file to stay mapped/openable.
+        std::mem::forget(tmp);
+        unsafe { memmap2::MmapOptions::new().map(&file).unwrap() }
+    }
+
+    #[test]
+    fn test_flat_vectors_mmap_read_through_matches_data() {
+        let dim = 4;
+        let count = 3;
+        let data: Vec<f32> = (0..(dim * count) as u32).map(|x| x as f32).collect();
+        let mmap = mmap_fixture(&data, dim, count);
+
+        let fv = FlatVectors::from_mmap(mmap, 16, dim, count).unwrap();
+        assert!(fv.is_mmap_backed());
+        assert_eq!(fv.len(), count);
+        for i in 0..count {
+            assert_eq!(fv.get(i), &data[i * dim..(i + 1) * dim]);
+        }
+    }
+
+    #[test]
+    fn test_flat_vectors_mmap_rejects_unaligned_offset() {
+        let data = vec![0.0f32; 8];
+        let mmap = mmap_fixture(&data, 4, 2);
+        // offset=1 is never 4-byte aligned — from_mmap must fail closed rather
+        // than transmute unaligned bytes to f32.
+        let result = FlatVectors::from_mmap(mmap, 1, 4, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flat_vectors_mmap_rejects_undersized_map() {
+        let data = vec![0.0f32; 4];
+        let mmap = mmap_fixture(&data, 4, 1);
+        // Header + 1 vector present, but claim 10 vectors — must fail closed.
+        let result = FlatVectors::from_mmap(mmap, 16, 4, 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flat_vectors_mmap_zero_out_tombstones_without_mutating_file() {
+        let dim = 4;
+        let count = 2;
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mmap = mmap_fixture(&data, dim, count);
+        let mut fv = FlatVectors::from_mmap(mmap, 16, dim, count).unwrap();
+
+        fv.zero_out(0);
+        assert!(fv.get(0).iter().all(|x| x.is_nan()));
+        assert_eq!(fv.get(1), &[5.0, 6.0, 7.0, 8.0], "untouched row unaffected");
+    }
+
+    #[test]
+    fn test_flat_vectors_push_panics_on_mmap_storage() {
+        let data = vec![0.0f32; 4];
+        let mmap = mmap_fixture(&data, 4, 1);
+        let mut fv = FlatVectors::from_mmap(mmap, 16, 4, 1).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fv.push(&[1.0, 2.0, 3.0, 4.0]);
+        }));
+        assert!(
+            result.is_err(),
+            "push on mmap-backed storage must fail loud, not silently succeed"
+        );
     }
 
     #[test]

@@ -244,16 +244,21 @@ db.close();
 
 ### WASM (Browser / Edge)
 
-```html
-<script type="module">
-  import init, { WasmRvfStore } from './rvf_wasm.js';
-  await init();
+`@ruvector/rvf-wasm` exports a low-level C-ABI module, not a `WasmRvfStore`
+class — use the `@ruvector/rvf` SDK's `wasm` backend for ergonomic access
+(see [#705](https://github.com/ruvnet/RuVector/issues/705)):
 
-  const store = WasmRvfStore.create(384);
-  store.ingest(1, new Float32Array(384));
-  const results = store.query(new Float32Array(384), 10);
-  console.log(results); // [{ id, distance }]
-</script>
+```javascript
+import { RvfDatabase } from '@ruvector/rvf';
+
+const db = await RvfDatabase.create('unused-in-wasm', { dimensions: 384 }, 'wasm');
+await db.ingestBatch([{ id: 'a', vector: new Float32Array(384) }]);
+const results = await db.query(new Float32Array(384), 10);
+console.log(results); // [{ id, distance }]
+
+// In-memory only — persist across page loads via exportBytes()/openBytes():
+const bytes = await db.exportBytes();       // save `bytes` to IndexedDB/OPFS
+const reopened = await RvfDatabase.openBytes(bytes, 'wasm');
 ```
 
 The WASM binary is **~46 KB** (control plane with in-memory store) or **~5.5 KB** (tile microkernel for Cognitum). No backend required.
