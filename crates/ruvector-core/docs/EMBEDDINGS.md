@@ -151,6 +151,67 @@ model.save_pretrained("./onnx-model")
 tokenizer.save_pretrained("./onnx-model")
 ```
 
+## Native Pure-Rust (Local, No API Costs, No Export Step)
+
+`LatticeEmbedding` runs BERT-family embedding models in-process with no Python, no ONNX
+export step, and no network calls after the first model download. It is already in this
+crate behind the `lattice-embeddings` feature.
+
+```toml
+[dependencies]
+ruvector-core = { version = "2.3", features = ["lattice-embeddings"] }
+```
+
+```rust
+use ruvector_core::{AgenticDB, embeddings::LatticeEmbedding, types::DbOptions};
+use std::sync::Arc;
+
+let provider = Arc::new(LatticeEmbedding::from_pretrained("bge-small-en-v1.5")?);
+
+let mut options = DbOptions::default();
+options.dimensions = 384; // bge-small-en-v1.5
+options.storage_path = "agenticdb.db".to_string();
+
+let db = AgenticDB::with_embedding_provider(options, provider)?;
+```
+
+BERT-family models (BGE, E5, MiniLM) download from HuggingFace into `~/.lattice/models`
+on first use. Vectors are L2-normalized, so a dot-product index works as well as cosine.
+
+A runnable example is in `crates/ruvector-core/examples/lattice_embedding_example.rs`.
+
+**Requires Rust 1.93.** `lattice-embed` 0.6.1 declares `rust-version = 1.93` (edition 2024),
+and cargo enforces that before compiling, so enabling this feature raises the toolchain
+floor for the whole build. That is why it is opt-in rather than a default.
+
+### Asymmetric models and query embedding
+
+This is worth knowing before choosing a model, because it is invisible from the call site.
+
+BGE, E5, and Qwen3-Embedding are *asymmetric* retrievers: the query side is prefixed with a
+retrieval instruction, the document side is not. `LatticeEmbedding` follows that —
+`EmbeddingProvider::embed` is the passage side, and the inherent `LatticeEmbedding::embed_query`
+applies the query instruction.
+
+`AgenticDB` reaches its provider through the `EmbeddingProvider` trait, which has one
+role-neutral `embed`. Its search entry points (`retrieve_similar_episodes`, `search_skills`,
+`find_relevant_turns`, `search`) call the same method its indexing paths call, so queries
+issued through `AgenticDB` are embedded with the **passage** side and the query instruction
+is not applied.
+
+What that means in practice:
+
+- **MiniLM is unaffected.** It is genuinely symmetric — contrastive training on raw text, no
+  prefix — so its query and passage sides are equivalent and nothing is lost.
+- **On BGE, E5, or Qwen3-Embedding**, retrieval quality through `AgenticDB` will be lower than
+  the same model scores in a harness that embeds queries with `embed_query`. Stored documents
+  are correct either way; it is the query side that differs.
+
+If you want asymmetric retrieval at full strength today, embed queries yourself with
+`LatticeEmbedding::embed_query` and query the vector index directly rather than through
+`AgenticDB`'s text-search helpers. Whether `AgenticDB` should offer a query-side path is a
+design question for this project, not something this provider can decide from underneath.
+
 ## Feature Flags
 
 ### `real-embeddings` (Optional)
@@ -235,6 +296,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **Cons**: Model storage (~100MB), setup complexity
 - **Best for**: Edge deployment, high-volume apps
 
+### Native Pure-Rust (`LatticeEmbedding`)
+- **Pros**: No API costs, offline after first download, no ONNX export step, no Python
+- **Cons**: Model storage (~130MB for bge-small), raises the build's Rust floor to 1.93
+- **Best for**: Local and offline deployments that would rather not maintain an export pipeline
+
 ### Hash-based (Default)
 - **Pros**: Zero dependencies, instant, no setup
 - **Cons**: Not semantic, only for testing
@@ -244,7 +310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 1. **Development/Testing**: Use hash-based (default)
 2. **Production (Cloud)**: Use `ApiEmbedding::openai()`
-3. **Production (Edge/Offline)**: Implement ONNX provider
+3. **Production (Edge/Offline)**: Use `LatticeEmbedding` (no export step), or implement an ONNX provider
 4. **Custom Models**: Implement `EmbeddingProvider` trait
 
 ## Migration Path
