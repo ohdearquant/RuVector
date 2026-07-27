@@ -36,6 +36,18 @@ export declare class RvfDatabase {
      */
     static openReadonly(path: string, backend?: BackendType): Promise<RvfDatabase>;
     /**
+     * Open a store from an in-memory `.rvf` byte buffer.
+     *
+     * Primarily for the WASM backend, which has no filesystem access — this is
+     * the supported way to durably persist a browser-side store (e.g. to
+     * IndexedDB/OPFS) and reload it later. The node backend does not support
+     * this and will throw.
+     *
+     * @param bytes    A `.rvf` byte buffer, previously produced by `exportBytes()`.
+     * @param backend  Backend to use. Default: `'auto'`.
+     */
+    static openBytes(bytes: Uint8Array, backend?: BackendType): Promise<RvfDatabase>;
+    /**
      * Create an RvfDatabase from an already-initialized backend.
      *
      * Used internally (e.g. by `derive()`) to wrap a child backend that was
@@ -67,8 +79,8 @@ export declare class RvfDatabase {
      *
      * The count can be passed positionally (`query(vec, 10)`) or via an
      * options object (`query(vec, { k: 10, efSearch: 200 })`, with `topK`
-     * and `limit` accepted as aliases for `k`). Passing an object without a
-     * usable count, or a non-positive-integer count, throws a clear
+     * and `limit` accepted as aliases for `k`). Conflicting aliases, an object
+     * without a usable count, or a count outside the positive `u32` range throws a clear
      * {@link RvfErrorCode.InvalidArgument} rather than a low-level N-API error.
      *
      * @param vector   The query embedding.
@@ -111,6 +123,14 @@ export declare class RvfDatabase {
     segments(): Promise<RvfSegmentInfo[]>;
     /** Get the vector dimensionality. */
     dimension(): Promise<number>;
+    /**
+     * Serialize the store to an in-memory `.rvf` byte buffer.
+     *
+     * Use with `RvfDatabase.openBytes()` to durably persist a WASM-backed
+     * (browser) store — e.g. writing the result to IndexedDB/OPFS. Not
+     * supported by the node backend (which already persists to a file path).
+     */
+    exportBytes(): Promise<Uint8Array>;
     /**
      * Close the store, releasing the writer lock and flushing pending data.
      *

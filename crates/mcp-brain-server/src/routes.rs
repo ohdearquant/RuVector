@@ -585,7 +585,7 @@ pub fn run_enhanced_training_cycle(state: &AppState, force_full: bool) -> Enhanc
             let skip_reflection = format!(
                 "Incremental skip: no new memories since {}. SONA: {}",
                 cutoff.format("%H:%M:%S"),
-                &sona_result
+                sona_result
             );
             return EnhancedTrainingResult {
                 sona_message: sona_result,

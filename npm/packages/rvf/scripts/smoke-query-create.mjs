@@ -51,7 +51,18 @@ function mockBackend() {
   assert.strictEqual(be._calls.at(-1).options.efSearch, 200, 'object options passthrough');
   ok('#657 object {k, efSearch} forwards efSearch');
 
-  for (const [arg, label] of [[{}, 'no count'], [-1, 'negative'], [2.5, 'non-integer'], [0, 'zero']]) {
+  await db.query(v, { k: 6, topK: 6, limit: 6 });
+  assert.strictEqual(be._calls.at(-1).count, 6, 'matching aliases');
+  ok('#657 matching count aliases are accepted');
+
+  for (const [arg, label] of [
+    [{}, 'no count'],
+    [{ k: 2, topK: 3 }, 'conflicting aliases'],
+    [-1, 'negative'],
+    [2.5, 'non-integer'],
+    [0, 'zero'],
+    [0x1_0000_0000, 'larger than u32'],
+  ]) {
     await assert.rejects(
       () => db.query(v, arg),
       (e) => e instanceof RvfError && e.code === RvfErrorCode.InvalidArgument,
@@ -86,9 +97,34 @@ function mockBackend() {
 
     // overwrite:true removes the old file (+ its sidecar) then proceeds
     fs.writeFileSync(`${target}.idmap.json`, '{"stale":true}');
-    await RvfDatabase.create(target, { dimensions: 4, overwrite: true }, 'node');
+    const replaced = await RvfDatabase.create(target, { dimensions: 4, overwrite: true }, 'node');
     assert.ok(!fs.existsSync(`${target}.idmap.json`), 'overwrite should clear stale sidecar');
     ok('#658 create({overwrite:true}) clears old file + sidecar and proceeds');
+    await replaced.close();
+
+    // A failed replacement restores both original files instead of destroying
+    // the store before the native create succeeds.
+    const rollbackTarget = path.join(tmp, 'rollback.rvf');
+    const rollbackSidecar = `${rollbackTarget}.idmap.json`;
+    fs.writeFileSync(rollbackTarget, 'original-store');
+    fs.writeFileSync(rollbackSidecar, 'original-sidecar');
+    await assert.rejects(
+      () => RvfDatabase.create(rollbackTarget, { dimensions: 0, overwrite: true }, 'node'),
+      (e) => e instanceof RvfError && e.code === RvfErrorCode.InvalidOptions,
+      'invalid replacement should fail before losing the original store',
+    );
+    assert.strictEqual(fs.readFileSync(rollbackTarget, 'utf-8'), 'original-store');
+    assert.strictEqual(fs.readFileSync(rollbackSidecar, 'utf-8'), 'original-sidecar');
+    ok('#658 failed overwrite restores the original store and sidecar');
+
+    const orphanTarget = path.join(tmp, 'orphan.rvf');
+    fs.writeFileSync(`${orphanTarget}.idmap.json`, '{"orphan":true}');
+    await assert.rejects(
+      () => RvfDatabase.create(orphanTarget, { dimensions: 4 }, 'node'),
+      (e) => e instanceof RvfError && e.code === RvfErrorCode.FileExists,
+      'an orphaned ID-map sidecar must block a fresh create',
+    );
+    ok('#658 orphaned sidecar is not silently reused');
 
     fs.rmSync(tmp, { recursive: true, force: true });
   }

@@ -87,6 +87,26 @@ export class RvfDatabase {
   }
 
   /**
+   * Open a store from an in-memory `.rvf` byte buffer.
+   *
+   * Primarily for the WASM backend, which has no filesystem access — this is
+   * the supported way to durably persist a browser-side store (e.g. to
+   * IndexedDB/OPFS) and reload it later. The node backend does not support
+   * this and will throw.
+   *
+   * @param bytes    A `.rvf` byte buffer, previously produced by `exportBytes()`.
+   * @param backend  Backend to use. Default: `'auto'`.
+   */
+  static async openBytes(
+    bytes: Uint8Array,
+    backend: BackendType = 'auto',
+  ): Promise<RvfDatabase> {
+    const impl = resolveBackend(backend);
+    await impl.openBytes(bytes);
+    return new RvfDatabase(impl);
+  }
+
+  /**
    * Create an RvfDatabase from an already-initialized backend.
    *
    * Used internally (e.g. by `derive()`) to wrap a child backend that was
@@ -141,8 +161,8 @@ export class RvfDatabase {
    *
    * The count can be passed positionally (`query(vec, 10)`) or via an
    * options object (`query(vec, { k: 10, efSearch: 200 })`, with `topK`
-   * and `limit` accepted as aliases for `k`). Passing an object without a
-   * usable count, or a non-positive-integer count, throws a clear
+   * and `limit` accepted as aliases for `k`). Conflicting aliases, an object
+   * without a usable count, or a count outside the positive `u32` range throws a clear
    * {@link RvfErrorCode.InvalidArgument} rather than a low-level N-API error.
    *
    * @param vector   The query embedding.
@@ -267,6 +287,22 @@ export class RvfDatabase {
   }
 
   // -----------------------------------------------------------------------
+  // Byte-level persistence (WASM backend)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Serialize the store to an in-memory `.rvf` byte buffer.
+   *
+   * Use with `RvfDatabase.openBytes()` to durably persist a WASM-backed
+   * (browser) store — e.g. writing the result to IndexedDB/OPFS. Not
+   * supported by the node backend (which already persists to a file path).
+   */
+  async exportBytes(): Promise<Uint8Array> {
+    this.ensureOpen();
+    return this.backend.exportBytes();
+  }
+
+  // -----------------------------------------------------------------------
   // Lifecycle
   // -----------------------------------------------------------------------
 
@@ -317,23 +353,35 @@ function normalizeQueryArgs(
 
   if (typeof k === 'object' && k !== null) {
     const { k: kk, topK, limit, ...rest } = k;
-    count = kk ?? topK ?? limit;
-    if (count === undefined) {
+    const aliases = [kk, topK, limit].filter((value) => value !== undefined);
+    if (aliases.length === 0) {
       throw new RvfError(
         RvfErrorCode.InvalidArgument,
         'query() options object must specify a result count as `k`, `topK`, or `limit`',
       );
     }
+    if (aliases.some((value) => value !== aliases[0])) {
+      throw new RvfError(
+        RvfErrorCode.InvalidArgument,
+        '`k`, `topK`, and `limit` must agree when more than one is supplied',
+      );
+    }
+    count = aliases[0];
     // Merge object-form options with any explicit third argument (explicit wins).
     queryOptions = { ...rest, ...options };
   } else {
     count = k;
   }
 
-  if (typeof count !== 'number' || !Number.isInteger(count) || count <= 0) {
+  if (
+    typeof count !== 'number' ||
+    !Number.isSafeInteger(count) ||
+    count <= 0 ||
+    count > 0xffff_ffff
+  ) {
     throw new RvfError(
       RvfErrorCode.InvalidArgument,
-      `query() result count must be a positive integer, got ${String(count)}`,
+      `query() result count must be a positive u32 integer, got ${String(count)}`,
     );
   }
 

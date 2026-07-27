@@ -3029,6 +3029,51 @@ function sanitizeDimension(value, fallback) {
   return (Number.isInteger(value) && value > 0 && value <= 65536) ? value : fallback;
 }
 
+/**
+ * Write a file atomically: serialize to a unique temp file in the same
+ * directory, then rename() over the target. rename() is atomic on a POSIX
+ * filesystem, so a concurrent reader never observes a torn/half-written file.
+ * This is the root-cause fix for the intelligence.json wipe under Claude Code,
+ * where every hook is a separate short-lived process sharing the store: a
+ * plain writeFileSync lets one process read a half-written file mid-write.
+ * The temp name carries pid + timestamp so concurrent writers never collide on
+ * the temp file; the final rename is last-writer-wins.
+ */
+function atomicWriteFileSync(filePath, data) {
+  const dir = path.dirname(filePath);
+  const tmp = path.join(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${Date.now()}`);
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort temp cleanup */ }
+    throw err;
+  }
+}
+
+/**
+ * Read a JSON intelligence store for a standalone command. Returns `{}` for a
+ * missing store (legitimate fresh start), but on a corrupt/unparseable store
+ * quarantines the file (renames it aside) and throws instead of returning `{}`.
+ * The previous `try { parse } catch {}` → `{}` pattern let a corrupt read
+ * degrade to an empty object that the command then wrote back, wiping the
+ * store. Mirrors Intelligence.load()'s corrupt handling.
+ */
+function readIntelStoreSafe(dataPath) {
+  if (!fs.existsSync(dataPath)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
+  } catch (err) {
+    const quarantine = `${dataPath}.corrupt-${Date.now()}`;
+    try { fs.renameSync(dataPath, quarantine); } catch { /* still fail loud below */ }
+    throw new Error(
+      `ruvector: intelligence store at ${dataPath} is corrupt and was quarantined to ` +
+      `${quarantine} rather than overwritten with an empty store — ` +
+      `restore it or delete it to start fresh. (${err.message})`
+    );
+  }
+}
+
 class Intelligence {
   constructor(options = {}) {
     this.intelPath = this.getIntelPath();
@@ -3156,39 +3201,56 @@ class Intelligence {
       edges: [],
       stats: { total_patterns: 0, total_memories: 0, total_trajectories: 0, total_errors: 0, session_count: 0, last_session: 0 }
     };
+    // A missing store is a legitimate fresh start.
+    if (!fs.existsSync(this.intelPath)) return defaults;
+
+    let data;
     try {
-      if (fs.existsSync(this.intelPath)) {
-        const data = JSON.parse(fs.readFileSync(this.intelPath, 'utf-8'));
-        // Merge with defaults to ensure all fields exist. The file is
-        // untrusted on-disk input (ADR-210 security pass): shape-check each
-        // field so a hand-edited/corrupted store cannot crash later code
-        // that iterates arrays or spreads objects.
-        const asArray = (v, dflt) => (Array.isArray(v) ? v : dflt);
-        const asObject = (v, dflt) => (v && typeof v === 'object' && !Array.isArray(v) ? v : dflt);
-        return {
-          patterns: asObject(data.patterns, defaults.patterns),
-          memories: asArray(data.memories, defaults.memories),
-          trajectories: asArray(data.trajectories, defaults.trajectories),
-          errors: asObject(data.errors, defaults.errors),
-          file_sequences: asArray(data.file_sequences, defaults.file_sequences),
-          agents: asObject(data.agents, defaults.agents),
-          edges: asArray(data.edges, defaults.edges),
-          stats: { ...defaults.stats, ...asObject(data.stats, {}) },
-          // ADR-210 D0: embedding provenance of stored memory vectors
-          // (null = legacy store, read-only for vector writes until reembed).
-          // Malformed records are treated as absent (sanitized, never crash).
-          embeddingProvenance: sanitizeProvenanceSafe(data.embeddingProvenance),
-          // Preserve in-flight trajectories so trajectory-end (run in a later
-          // process) can find what trajectory-begin recorded (#517)
-          activeTrajectories: data.activeTrajectories || {},
-          // Preserve auxiliary learned data if present
-          coEditPatterns: data.coEditPatterns || undefined,
-          sequences: data.sequences || undefined,
-          learning: data.learning || undefined
-        };
-      }
-    } catch {}
-    return defaults;
+      data = JSON.parse(fs.readFileSync(this.intelPath, 'utf-8'));
+    } catch (err) {
+      // A corrupt/unreadable store must NOT silently degrade to empty defaults:
+      // the caller would then save() the emptiness back over the real data,
+      // destroying weeks of accumulated memories with no signal. Quarantine the
+      // file (rename it aside so it is preserved and the next save cannot clobber
+      // it) and fail loud. With atomicWriteFileSync() below, a concurrent writer
+      // can no longer produce a torn read, so reaching here means genuine
+      // corruption — a fresh store restarts cleanly on the next run.
+      const quarantine = `${this.intelPath}.corrupt-${Date.now()}`;
+      try { fs.renameSync(this.intelPath, quarantine); } catch { /* still fail loud below */ }
+      throw new Error(
+        `ruvector: intelligence store at ${this.intelPath} is corrupt and was quarantined ` +
+        `to ${quarantine} rather than overwritten with an empty store — ` +
+        `restore it or delete it to start fresh. (${err.message})`
+      );
+    }
+
+    // Merge with defaults to ensure all fields exist. The file is
+    // untrusted on-disk input (ADR-210 security pass): shape-check each
+    // field so a hand-edited/corrupted store cannot crash later code
+    // that iterates arrays or spreads objects.
+    const asArray = (v, dflt) => (Array.isArray(v) ? v : dflt);
+    const asObject = (v, dflt) => (v && typeof v === 'object' && !Array.isArray(v) ? v : dflt);
+    return {
+      patterns: asObject(data.patterns, defaults.patterns),
+      memories: asArray(data.memories, defaults.memories),
+      trajectories: asArray(data.trajectories, defaults.trajectories),
+      errors: asObject(data.errors, defaults.errors),
+      file_sequences: asArray(data.file_sequences, defaults.file_sequences),
+      agents: asObject(data.agents, defaults.agents),
+      edges: asArray(data.edges, defaults.edges),
+      stats: { ...defaults.stats, ...asObject(data.stats, {}) },
+      // ADR-210 D0: embedding provenance of stored memory vectors
+      // (null = legacy store, read-only for vector writes until reembed).
+      // Malformed records are treated as absent (sanitized, never crash).
+      embeddingProvenance: sanitizeProvenanceSafe(data.embeddingProvenance),
+      // Preserve in-flight trajectories so trajectory-end (run in a later
+      // process) can find what trajectory-begin recorded (#517)
+      activeTrajectories: data.activeTrajectories || {},
+      // Preserve auxiliary learned data if present
+      coEditPatterns: data.coEditPatterns || undefined,
+      sequences: data.sequences || undefined,
+      learning: data.learning || undefined
+    };
   }
 
   save() {
@@ -3217,7 +3279,7 @@ class Intelligence {
       }
     }
 
-    fs.writeFileSync(this.intelPath, JSON.stringify(this.data, null, 2));
+    atomicWriteFileSync(this.intelPath, JSON.stringify(this.data, null, 2));
   }
 
   now() { return Math.floor(Date.now() / 1000); }
@@ -5614,12 +5676,7 @@ hooksCmd.command('learning-config')
 
     // Load existing intelligence data
     const dataPath = path.join(process.cwd(), '.ruvector', 'intelligence.json');
-    let data = {};
-    try {
-      if (fs.existsSync(dataPath)) {
-        data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
-      }
-    } catch (e) {}
+    let data = readIntelStoreSafe(dataPath);
 
     const engine = new LearningEngineClass();
     if (data.learning) {
@@ -5653,7 +5710,7 @@ hooksCmd.command('learning-config')
     // Save
     data.learning = engine.export();
     fs.mkdirSync(path.dirname(dataPath), { recursive: true });
-    fs.writeFileSync(dataPath, JSON.stringify(data, null, 2));
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
 
     console.log(JSON.stringify({
       success: true,
@@ -5673,12 +5730,7 @@ hooksCmd.command('learning-stats')
     }
 
     const dataPath = path.join(process.cwd(), '.ruvector', 'intelligence.json');
-    let data = {};
-    try {
-      if (fs.existsSync(dataPath)) {
-        data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
-      }
-    } catch (e) {}
+    let data = readIntelStoreSafe(dataPath);
 
     const engine = new LearningEngineClass();
     if (data.learning) {
@@ -5721,12 +5773,7 @@ hooksCmd.command('learning-update')
     }
 
     const dataPath = path.join(process.cwd(), '.ruvector', 'intelligence.json');
-    let data = {};
-    try {
-      if (fs.existsSync(dataPath)) {
-        data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
-      }
-    } catch (e) {}
+    let data = readIntelStoreSafe(dataPath);
 
     const engine = new LearningEngineClass();
     if (data.learning) {
@@ -5746,7 +5793,7 @@ hooksCmd.command('learning-update')
 
     // Save
     data.learning = engine.export();
-    fs.writeFileSync(dataPath, JSON.stringify(data, null, 2));
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
 
     console.log(JSON.stringify({
       success: true,
@@ -5769,12 +5816,7 @@ hooksCmd.command('compress')
     }
 
     const dataPath = path.join(process.cwd(), '.ruvector', 'intelligence.json');
-    let data = {};
-    try {
-      if (fs.existsSync(dataPath)) {
-        data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
-      }
-    } catch (e) {}
+    let data = readIntelStoreSafe(dataPath);
 
     const compress = new TensorCompressClass({
       autoCompress: false,
@@ -5809,7 +5851,7 @@ hooksCmd.command('compress')
 
     // Save compressed data
     data.compressedPatterns = compress.export();
-    fs.writeFileSync(dataPath, JSON.stringify(data, null, 2));
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
 
     console.log(JSON.stringify({
       success: true,
@@ -5828,12 +5870,7 @@ hooksCmd.command('compress-stats')
     }
 
     const dataPath = path.join(process.cwd(), '.ruvector', 'intelligence.json');
-    let data = {};
-    try {
-      if (fs.existsSync(dataPath)) {
-        data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
-      }
-    } catch (e) {}
+    let data = readIntelStoreSafe(dataPath);
 
     const compress = new TensorCompressClass({ autoCompress: false });
     if (data.compressedPatterns) {
@@ -5882,12 +5919,7 @@ hooksCmd.command('compress-store')
     }
 
     const dataPath = path.join(process.cwd(), '.ruvector', 'intelligence.json');
-    let data = {};
-    try {
-      if (fs.existsSync(dataPath)) {
-        data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
-      }
-    } catch (e) {}
+    let data = readIntelStoreSafe(dataPath);
 
     const compress = new TensorCompressClass({ autoCompress: false });
     if (data.compressedPatterns) {
@@ -5898,7 +5930,7 @@ hooksCmd.command('compress-store')
 
     data.compressedPatterns = compress.export();
     fs.mkdirSync(path.dirname(dataPath), { recursive: true });
-    fs.writeFileSync(dataPath, JSON.stringify(data, null, 2));
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
 
     const stats = compress.getStats();
     console.log(JSON.stringify({
@@ -5921,12 +5953,7 @@ hooksCmd.command('compress-get')
     }
 
     const dataPath = path.join(process.cwd(), '.ruvector', 'intelligence.json');
-    let data = {};
-    try {
-      if (fs.existsSync(dataPath)) {
-        data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
-      }
-    } catch (e) {}
+    let data = readIntelStoreSafe(dataPath);
 
     const compress = new TensorCompressClass({ autoCompress: false });
     if (data.compressedPatterns) {
@@ -5962,12 +5989,7 @@ hooksCmd.command('learn')
     }
 
     const dataPath = path.join(process.cwd(), '.ruvector', 'intelligence.json');
-    let data = {};
-    try {
-      if (fs.existsSync(dataPath)) {
-        data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
-      }
-    } catch (e) {}
+    let data = readIntelStoreSafe(dataPath);
 
     const engine = new LearningEngineClass();
     if (data.learning) {
@@ -6001,7 +6023,7 @@ hooksCmd.command('learn')
     // Save
     data.learning = engine.export();
     fs.mkdirSync(path.dirname(dataPath), { recursive: true });
-    fs.writeFileSync(dataPath, JSON.stringify(data, null, 2));
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
 
     console.log(JSON.stringify(result));
   });
@@ -6046,12 +6068,7 @@ hooksCmd.command('batch-learn')
     }
 
     const dataPath = path.join(process.cwd(), '.ruvector', 'intelligence.json');
-    let data = {};
-    try {
-      if (fs.existsSync(dataPath)) {
-        data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
-      }
-    } catch (e) {}
+    let data = readIntelStoreSafe(dataPath);
 
     const engine = new LearningEngineClass();
     if (data.learning) {
@@ -6079,7 +6096,7 @@ hooksCmd.command('batch-learn')
     // Save
     data.learning = engine.export();
     fs.mkdirSync(path.dirname(dataPath), { recursive: true });
-    fs.writeFileSync(dataPath, JSON.stringify(data, null, 2));
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
 
     const stats = engine.getStatsSummary();
     console.log(JSON.stringify({
@@ -8121,13 +8138,16 @@ const mcpCmd = program.command('mcp').description('MCP (Model Context Protocol) 
 mcpCmd.command('start')
   .description('Start the RuVector MCP server')
   .action(() => {
-    // Execute the mcp-server.js directly
     const mcpServerPath = path.join(__dirname, 'mcp-server.js');
     if (!fs.existsSync(mcpServerPath)) {
       console.error(chalk.red('Error: MCP server not found at'), mcpServerPath);
       process.exit(1);
     }
-    require(mcpServerPath);
+    const { main } = require(mcpServerPath);
+    main().catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
   });
 
 mcpCmd.command('info')
@@ -8370,7 +8390,7 @@ mcpCmd.command('tools')
 
 mcpCmd.command('test')
   .description('Test MCP server setup and tool registration')
-  .action(() => {
+  .action(async () => {
     console.log(chalk.bold.cyan('\nMCP Server Test Results'));
     console.log(chalk.dim('-'.repeat(40)));
 
@@ -8425,16 +8445,94 @@ mcpCmd.command('test')
       console.log(`  ${chalk.yellow('WARN')} Could not parse tool count: ${e.message}`);
     }
 
-    // Test 5: version check
-    try {
-      const src = fs.readFileSync(mcpServerPath, 'utf8');
-      const verMatch = src.match(/version:\s*'([^']+)'/);
-      if (verMatch) {
-        const pkg = require(path.join(__dirname, '..', 'package.json'));
-        const match = verMatch[1] === pkg.version;
-        console.log(`  ${match ? chalk.green('PASS') : chalk.yellow('WARN')} Server version: ${verMatch[1]}${match ? '' : ` (package: ${pkg.version})`}`);
-      }
-    } catch {}
+    // Test 5: live handshake.
+    //
+    // Every check above is static — the file parses, the SDK resolves, the
+    // TOOLS array greps to N entries. All of them passed against a server that
+    // never started, because nothing here launched it. This spawns the real
+    // `mcp start` path and speaks the protocol, which is the only check that
+    // can tell a working server from a dead one.
+    const handshake = await new Promise((resolve) => {
+      const { spawn } = require('child_process');
+      const child = spawn(process.execPath, [__filename, 'mcp', 'start'], {
+        stdio: ['pipe', 'pipe', 'ignore'],
+      });
+
+      let buf = '';
+      const noise = [];
+      let settled = false;
+      let draining = false;
+      const finish = (r) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { child.stdin.end(); } catch {}
+        try { child.kill('SIGTERM'); } catch {}
+        resolve(r);
+      };
+      const timer = setTimeout(
+        () => finish({ ok: false, reason: 'no response within 45s (transport never connected?)' }),
+        45000
+      );
+
+      child.stdout.on('data', (chunk) => {
+        buf += chunk.toString();
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line) continue;
+          if (!line.startsWith('{')) { noise.push(line); continue; }
+          try {
+            const msg = JSON.parse(line);
+            if (msg.id === 1 && msg.error) {
+              return finish({ ok: false, reason: JSON.stringify(msg.error), noise });
+            }
+            if (msg.id === 1 && msg.result && !draining) {
+              // Drain before settling: the loader's stdout chatter is written
+              // *after* the initialize reply, so returning here immediately
+              // would race past the very noise this check exists to catch.
+              draining = true;
+              const info = msg.result.serverInfo;
+              setTimeout(() => finish({ ok: true, info, noise }), 3000);
+            }
+          } catch { noise.push(line); }
+        }
+      });
+      child.on('error', (e) => finish({ ok: false, reason: e.message }));
+      child.on('exit', (code) => finish({ ok: false, reason: `server exited early (code ${code})` }));
+
+      child.stdin.write(JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: {
+          protocolVersion: '2025-06-18', capabilities: {},
+          clientInfo: { name: 'ruvector-mcp-test', version: '1.0.0' },
+        },
+      }) + '\n');
+    });
+
+    if (!handshake.ok) {
+      console.log(`  ${chalk.red('FAIL')} live handshake: ${handshake.reason}`);
+      console.log(chalk.bold.red('\n  Checks failed — the server does not answer MCP requests.\n'));
+      process.exit(1);
+    }
+    console.log(`  ${chalk.green('PASS')} live handshake (server: ${handshake.info && handshake.info.name})`);
+
+    const pkg = require(path.join(__dirname, '..', 'package.json'));
+    if (!handshake.info || handshake.info.version !== pkg.version) {
+      console.log(`  ${chalk.red('FAIL')} Server version: ${handshake.info && handshake.info.version} (package: ${pkg.version})`);
+      console.log(chalk.bold.red('\n  Checks failed — the live server version does not match the package.\n'));
+      process.exit(1);
+    }
+    console.log(`  ${chalk.green('PASS')} Server version: ${handshake.info.version}`);
+
+    if (handshake.noise && handshake.noise.length) {
+      // stdio MCP requires stdout to carry only newline-delimited JSON-RPC.
+      console.log(`  ${chalk.red('FAIL')} stdout carries non-JSON output: ${JSON.stringify(handshake.noise.slice(0, 2))}`);
+      console.log(chalk.bold.red('\n  Checks failed — stdout noise corrupts the JSON-RPC stream.\n'));
+      process.exit(1);
+    }
+    console.log(`  ${chalk.green('PASS')} stdout carries only JSON-RPC`);
 
     console.log(chalk.bold.green('\n  All checks passed.\n'));
     console.log(chalk.dim('  Setup: claude mcp add ruvector npx ruvector mcp start\n'));
@@ -10252,6 +10350,10 @@ harnessCmd
 // Bare `ruvector harness` defaults to status
 harnessCmd.action(() => printHarnessStatus({}));
 
-program.parse();
-
-
+// Only drive the CLI when executed directly; when required (e.g. by tests)
+// expose the store-durability internals instead of parsing argv.
+if (require.main === module) {
+  program.parse();
+} else {
+  module.exports = { atomicWriteFileSync, readIntelStoreSafe, Intelligence };
+}
