@@ -144,7 +144,16 @@ pub fn dot_product_distance(a: &[f32], b: &[f32]) -> f32 {
 /// Manhattan (L1) distance — delegates to SIMD when available
 #[inline]
 pub fn manhattan_distance(a: &[f32], b: &[f32]) -> f32 {
-    crate::simd_intrinsics::manhattan_distance_simd(a, b)
+    #[cfg(feature = "lattice-simd")]
+    {
+        lattice_embed::simd::manhattan_distance(a, b)
+    }
+    #[cfg(not(feature = "lattice-simd"))]
+    {
+        // `simd_intrinsics` dispatches x86_64 and aarch64 and falls through to
+        // scalar everywhere else, wasm32 included.
+        crate::simd_intrinsics::manhattan_distance_simd(a, b)
+    }
 }
 
 /// Batch distance calculation optimized with Rayon (native) or sequential (WASM)
@@ -244,6 +253,10 @@ mod tests {
         pub fn dot(a: &[f32], b: &[f32]) -> f32 {
             -a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
         }
+
+        pub fn manhattan(a: &[f32], b: &[f32]) -> f32 {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f32>()
+        }
     }
 
     /// Deterministic pseudo-random vectors, no dev-dependency needed.
@@ -293,6 +306,13 @@ mod tests {
                 assert!(
                     (got - want).abs() <= 1e-3 * want.abs().max(1.0),
                     "dot mismatch at dim={dim} seed={seed}: got {got}, want {want}"
+                );
+
+                let got = manhattan_distance(&a, &b);
+                let want = reference::manhattan(&a, &b);
+                assert!(
+                    (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                    "manhattan mismatch at dim={dim} seed={seed}: got {got}, want {want}"
                 );
             }
         }
