@@ -255,7 +255,10 @@ mod tests {
             s ^= s << 5;
             (s as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
-        ((0..dim).map(|_| next()).collect(), (0..dim).map(|_| next()).collect())
+        (
+            (0..dim).map(|_| next()).collect(),
+            (0..dim).map(|_| next()).collect(),
+        )
     }
 
     /// The active backend must agree with the scalar reference on every metric.
