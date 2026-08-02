@@ -42,7 +42,7 @@ impl Backend for CpuBackend {
         #[cfg(target_arch = "x86_64")]
         {
             let features = get_simd_features();
-            if features.has_avx2 {
+            if features.has_avx2 && features.has_fma {
                 return unsafe { dot_product_avx2(a, b) };
             } else if features.has_sse41 {
                 return unsafe { dot_product_sse(a, b) };
@@ -101,14 +101,14 @@ impl Backend for CpuBackend {
             }
             ActivationType::Gelu => {
                 #[cfg(target_arch = "x86_64")]
-                if features.has_avx2 {
+                if features.has_avx2 && features.has_fma {
                     return unsafe { gelu_avx2(data) };
                 }
                 gelu_scalar(data);
             }
             ActivationType::Silu | ActivationType::Swish => {
                 #[cfg(target_arch = "x86_64")]
-                if features.has_avx2 {
+                if features.has_avx2 && features.has_fma {
                     return unsafe { silu_avx2(data) };
                 }
                 silu_scalar(data);
@@ -134,8 +134,11 @@ impl Backend for CpuBackend {
         debug_assert_eq!(a.len(), b.len());
 
         #[cfg(target_arch = "x86_64")]
-        if get_simd_features().has_avx2 {
-            return unsafe { axpy_avx2(a, b, scalar) };
+        {
+            let features = get_simd_features();
+            if features.has_avx2 && features.has_fma {
+                return unsafe { axpy_avx2(a, b, scalar) };
+            }
         }
 
         for (x, y) in a.iter_mut().zip(b.iter()) {
@@ -181,10 +184,40 @@ impl Backend for CpuBackend {
     }
 }
 
+// ============ Portable approximation helpers ============
+//
+// These mirror, lane-for-lane, the rational tanh approximation used inside the
+// AVX2 activation kernels below. They carry no architecture cfg so they can be
+// exercised directly by tests on any host, independent of whether the SIMD
+// kernels themselves can run.
+
+/// Rational (Padé-form) approximation of tanh, saturated to tanh's true [-1, 1]
+/// range so large-magnitude inputs agree with the scalar tanh-based path
+/// instead of diverging.
+fn fast_tanh_approx(z: f32) -> f32 {
+    let z2 = z * z;
+    let num = 27.0 + z2;
+    let den = 27.0 + 9.0 * z2;
+    (z * num / den).clamp(-1.0, 1.0)
+}
+
+fn gelu_fast_scalar(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.7978845608;
+    const GELU_COEF: f32 = 0.044715;
+    let x3 = x * x * x;
+    let inner = SQRT_2_OVER_PI * (x + GELU_COEF * x3);
+    0.5 * x * (1.0 + fast_tanh_approx(inner))
+}
+
+fn silu_fast_scalar(x: f32) -> f32 {
+    let sigmoid = 0.5 + 0.5 * fast_tanh_approx(x * 0.5);
+    x * sigmoid
+}
+
 // ============ AVX2 Implementations ============
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
     let chunks = n / 8;
@@ -247,6 +280,7 @@ unsafe fn gelu_avx2(data: &mut [f32]) {
     // Constants for fast tanh approximation: tanh(x) ≈ x * (27 + x²) / (27 + 9x²)
     let c27 = _mm256_set1_ps(27.0);
     let c9 = _mm256_set1_ps(9.0);
+    let neg_one = _mm256_set1_ps(-1.0);
 
     for i in 0..chunks {
         let ptr = data.as_mut_ptr().add(i * 8);
@@ -259,11 +293,13 @@ unsafe fn gelu_avx2(data: &mut [f32]) {
         // inner = sqrt(2/π) * (x + 0.044715 * x³)
         let inner = _mm256_mul_ps(sqrt_2_over_pi, _mm256_fmadd_ps(coef, x3, x));
 
-        // Fast tanh approximation
+        // Fast tanh approximation, saturated to tanh's true [-1, 1] range so it
+        // agrees with the scalar tanh-based path for large-magnitude inputs
         let inner2 = _mm256_mul_ps(inner, inner);
         let num = _mm256_fmadd_ps(inner2, one, c27); // 27 + inner²
         let den = _mm256_fmadd_ps(inner2, c9, c27); // 27 + 9*inner²
-        let tanh_approx = _mm256_mul_ps(inner, _mm256_div_ps(num, den));
+        let tanh_raw = _mm256_mul_ps(inner, _mm256_div_ps(num, den));
+        let tanh_approx = _mm256_min_ps(_mm256_max_ps(tanh_raw, neg_one), one);
 
         // 0.5 * x * (1 + tanh)
         let result = _mm256_mul_ps(half, _mm256_mul_ps(x, _mm256_add_ps(one, tanh_approx)));
@@ -291,6 +327,7 @@ unsafe fn silu_avx2(data: &mut [f32]) {
     let c27 = _mm256_set1_ps(27.0);
     let c9 = _mm256_set1_ps(9.0);
     let one = _mm256_set1_ps(1.0);
+    let neg_one = _mm256_set1_ps(-1.0);
 
     for i in 0..chunks {
         let ptr = data.as_mut_ptr().add(i * 8);
@@ -299,11 +336,13 @@ unsafe fn silu_avx2(data: &mut [f32]) {
         // Use sigmoid(x) = 0.5 + 0.5 * tanh(x/2)
         let x_half = _mm256_mul_ps(x, half);
 
-        // Fast tanh(x/2)
+        // Fast tanh(x/2), saturated to tanh's true [-1, 1] range so it agrees
+        // with the scalar tanh-based path for large-magnitude inputs
         let xh2 = _mm256_mul_ps(x_half, x_half);
         let num = _mm256_fmadd_ps(xh2, one, c27);
         let den = _mm256_fmadd_ps(xh2, c9, c27);
-        let tanh_approx = _mm256_mul_ps(x_half, _mm256_div_ps(num, den));
+        let tanh_raw = _mm256_mul_ps(x_half, _mm256_div_ps(num, den));
+        let tanh_approx = _mm256_min_ps(_mm256_max_ps(tanh_raw, neg_one), one);
 
         // sigmoid = 0.5 + 0.5 * tanh
         let sigmoid = _mm256_fmadd_ps(half, tanh_approx, half);
@@ -339,7 +378,7 @@ unsafe fn add_avx2(a: &mut [f32], b: &[f32]) {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn axpy_avx2(a: &mut [f32], b: &[f32], scalar: f32) {
     let vs = _mm256_set1_ps(scalar);
     let chunks = a.len() / 8;
@@ -477,5 +516,64 @@ mod tests {
         let b = vec![1.0, 1.0, 1.0, 1.0];
         backend.axpy(&mut a, &b, 2.0);
         assert_eq!(a, vec![3.0, 4.0, 5.0, 6.0]);
+    }
+
+    // The AVX2 GELU/SiLU kernels cannot execute on this (non-x86_64) build
+    // host, so these tests exercise the portable scalar equivalent of the
+    // rational tanh approximation they use, established as accurate at
+    // crates/ruvector-sparse-inference/src/backend/cpu.rs.
+
+    #[test]
+    fn test_fast_tanh_approx_saturates() {
+        let mut max_abs_err = 0.0f32;
+        let mut z = -300.0f32;
+        while z <= 300.0 {
+            let approx = fast_tanh_approx(z);
+            assert!(
+                (-1.0..=1.0).contains(&approx),
+                "fast_tanh_approx({z}) = {approx} is outside [-1, 1]"
+            );
+            let exact = z.tanh();
+            max_abs_err = max_abs_err.max((approx - exact).abs());
+            z += 0.05;
+        }
+        assert!(
+            max_abs_err < 0.03,
+            "fast_tanh_approx diverged from f32::tanh by {max_abs_err}, expected < 0.03"
+        );
+    }
+
+    #[test]
+    fn test_gelu_fast_scalar_matches_exact_gelu() {
+        let mut max_abs_err = 0.0f32;
+        let mut x = -30.0f32;
+        while x <= 30.0 {
+            let approx = gelu_fast_scalar(x);
+            let mut exact = [x];
+            gelu_scalar(&mut exact);
+            max_abs_err = max_abs_err.max((approx - exact[0]).abs());
+            x += 0.02;
+        }
+        assert!(
+            max_abs_err < 0.03,
+            "saturating GELU approximation diverged from exact GELU by {max_abs_err}, expected < 0.03"
+        );
+    }
+
+    #[test]
+    fn test_silu_fast_scalar_matches_exact_silu() {
+        let mut max_abs_err = 0.0f32;
+        let mut x = -30.0f32;
+        while x <= 30.0 {
+            let approx = silu_fast_scalar(x);
+            let mut exact = [x];
+            silu_scalar(&mut exact);
+            max_abs_err = max_abs_err.max((approx - exact[0]).abs());
+            x += 0.02;
+        }
+        assert!(
+            max_abs_err < 0.05,
+            "saturating SiLU approximation diverged from exact SiLU by {max_abs_err}, expected < 0.05"
+        );
     }
 }
