@@ -5,10 +5,9 @@
 //! instructions on its own; nothing in this module has ever called SimSIMD,
 //! despite what this file's header used to say.
 //!
-//! With the `lattice-simd` feature, Euclidean, cosine, and dot product route
-//! through `lattice-embed`'s runtime-dispatched kernels (AVX-512F, AVX2, NEON,
-//! wasm32 SIMD128, each with its own scalar fallback). Manhattan stays scalar:
-//! lattice-embed 0.7.0 has no L1 kernel to route it to.
+//! With the `lattice-simd` feature, all four metrics route through
+//! `lattice-embed`'s runtime-dispatched kernels (AVX-512F, AVX2, NEON, wasm32
+//! SIMD128, each with its own scalar fallback).
 //!
 //! Both paths return the same values. Every metric keeps the sign and
 //! similarity-to-distance conversion this module already defined, and the
@@ -177,10 +176,23 @@ fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Manhattan distance (L1).
-///
-/// Not routed through lattice: lattice-embed 0.7.0 exposes no L1 kernel.
 #[inline]
 pub fn manhattan_distance(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(feature = "lattice-simd")]
+    {
+        // Equal lengths only, for the same reason as `euclidean_distance`: the
+        // scalar path indexes `b` by `a`'s length and panics on a short `b`,
+        // where lattice returns f32::MAX.
+        if a.len() == b.len() {
+            return lattice_embed::simd::manhattan_distance(a, b);
+        }
+    }
+
+    manhattan_distance_scalar(a, b)
+}
+
+#[inline]
+fn manhattan_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut sum = 0.0f32;
 
     let len = a.len();
