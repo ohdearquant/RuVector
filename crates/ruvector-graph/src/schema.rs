@@ -94,6 +94,13 @@ impl DistanceMetric {
                 // Single fused pass: accumulate q·c and c·c together so the
                 // candidate slice is read once (half the memory traffic of two
                 // separate `dot` calls).
+                //
+                // Deliberately left scalar even under `lattice-simd`. A kernel
+                // cosine takes only `(a, b)` and recomputes the query norm per
+                // candidate, which would discard the `query_norm` hoist this
+                // signature exists for, and would silently ignore a caller-supplied
+                // `query_norm` that differs from `‖query‖`. Vectorizing this arm
+                // needs a kernel that accepts a precomputed query norm.
                 let n = query.len().min(candidate.len());
                 let mut qc = 0.0f32;
                 let mut cc = 0.0f32;
@@ -110,6 +117,15 @@ impl DistanceMetric {
                 }
             }
             DistanceMetric::Euclidean => {
+                // Same equal-length guard as `dot`: the loop below truncates to
+                // the shorter slice, the kernel does not.
+                #[cfg(feature = "lattice-simd")]
+                {
+                    if query.len() == candidate.len() {
+                        return -lattice_embed::simd::euclidean_distance(query, candidate);
+                    }
+                }
+
                 let n = query.len().min(candidate.len());
                 let mut sum = 0.0f32;
                 for i in 0..n {
@@ -156,10 +172,24 @@ pub fn score_property(
 
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
+    // With `lattice-simd`, use explicit kernels rather than relying on
+    // autovectorization. This stays WASM-safe and no-feature-build-safe, the two
+    // properties that kept `simsimd` out of this layer: the dependency is
+    // optional, and its kernels compile to `simd128` on wasm32 where `simsimd`
+    // is unavailable.
+    //
+    // The equal-length guard is required, not defensive. The iterator form below
+    // truncates to the shorter slice, while the kernel returns 0.0 on a length
+    // mismatch, so unequal inputs must keep taking the scalar path to preserve
+    // this function's existing behaviour.
+    #[cfg(feature = "lattice-simd")]
+    {
+        if a.len() == b.len() {
+            return lattice_embed::simd::dot_product(a, b);
+        }
+    }
+
     // Iterator form so LLVM auto-vectorizes (SSE/AVX/NEON) without bounds checks.
-    // SIMD via `simsimd`/ruvector-core is a follow-up (ADR-252 P5) but is
-    // deliberately not a hard dependency here so the schema layer stays WASM- and
-    // no-feature-build-safe.
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
@@ -687,5 +717,79 @@ mod tests {
             .collect(),
         );
         assert!(s.validate_node(&n).is_ok());
+    }
+
+    /// Deterministic pseudo-random vectors, no dev-dependency needed.
+    fn vecs(dim: usize, seed: u32) -> (Vec<f32>, Vec<f32>) {
+        let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        (
+            (0..dim).map(|_| next()).collect(),
+            (0..dim).map(|_| next()).collect(),
+        )
+    }
+
+    /// Whichever `dot` backend is compiled in must agree with a naive scalar sum.
+    ///
+    /// This is what catches a wrong kernel or a wrong adapter: swapping
+    /// `dot_product` for a different kernel, or dropping the negation on the
+    /// Euclidean arm, still compiles and fails here.
+    #[test]
+    fn test_score_pre_matches_scalar_reference() {
+        // Dimensions straddling 4/8/16-lane widths and their remainders.
+        for dim in [1usize, 3, 4, 7, 8, 15, 16, 17, 31, 64, 127, 384, 768] {
+            for seed in 0..4u32 {
+                let (q, c) = vecs(dim, seed);
+
+                let want_dot: f32 = q.iter().zip(&c).map(|(x, y)| x * y).sum();
+                let got_dot = DistanceMetric::DotProduct.score_pre(&q, &c, 0.0);
+                assert!(
+                    (got_dot - want_dot).abs() <= 1e-3 * want_dot.abs().max(1.0),
+                    "dot mismatch dim={dim} seed={seed}: got {got_dot}, want {want_dot}"
+                );
+
+                let want_euc =
+                    -q.iter().zip(&c).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt();
+                let got_euc = DistanceMetric::Euclidean.score_pre(&q, &c, 0.0);
+                assert!(
+                    (got_euc - want_euc).abs() <= 1e-3 * want_euc.abs().max(1.0),
+                    "euclidean mismatch dim={dim} seed={seed}: got {got_euc}, want {want_euc}"
+                );
+
+                let qn = DistanceMetric::Cosine.query_norm(&q);
+                let want_qn = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+                assert!(
+                    (qn - want_qn).abs() <= 1e-3 * want_qn.abs().max(1.0),
+                    "query_norm mismatch dim={dim} seed={seed}: got {qn}, want {want_qn}"
+                );
+            }
+        }
+    }
+
+    /// Unequal lengths must keep the truncating scalar behaviour. The kernels
+    /// return 0.0 on a length mismatch, so a missing guard would show up here as
+    /// a zero instead of the truncated dot product.
+    #[test]
+    fn test_unequal_lengths_truncate_not_zero() {
+        let q = vec![1.0f32, 2.0, 3.0, 4.0];
+        let c = vec![1.0f32, 1.0, 1.0];
+
+        let got = DistanceMetric::DotProduct.score_pre(&q, &c, 0.0);
+        assert!(
+            (got - 6.0).abs() < 1e-5,
+            "expected truncated dot 6.0, got {got}"
+        );
+
+        let got = DistanceMetric::Euclidean.score_pre(&q, &c, 0.0);
+        let want = -(0.0f32 + 1.0 + 4.0).sqrt();
+        assert!(
+            (got - want).abs() < 1e-5,
+            "expected truncated euclidean {want}, got {got}"
+        );
     }
 }
