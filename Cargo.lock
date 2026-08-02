@@ -4921,14 +4921,14 @@ dependencies = [
 
 [[package]]
 name = "lattice-embed"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "188e4627dabd63544da5a57daabfe3105bf4d4970840f2e5a5c7f01123835ecb"
+checksum = "1f3af50558cf953df225b68ec160f1ea49b0965564f10a9b8577d15ac8452542"
 dependencies = [
  "async-trait",
  "blake3",
  "chrono",
- "lattice-inference",
+ "lattice-inference 0.7.0",
  "lru 0.16.4",
  "parking_lot 0.12.5",
  "serde",
@@ -4944,9 +4944,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b113852e4c522b6607cd8e01842b5dff7de307d4cc9223dfd798b0136e2aa62b"
 dependencies = [
- "axum 0.8.9",
  "clap",
- "futures",
  "half",
  "image 0.25.10",
  "indexmap 2.12.1",
@@ -4959,7 +4957,27 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
- "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "lattice-inference"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439a555d0b66e489e1c1291522143780fd9e0bbf0475c9f23fd299fa35df68a2"
+dependencies = [
+ "clap",
+ "half",
+ "image 0.25.10",
+ "indexmap 2.12.1",
+ "libc",
+ "memmap2",
+ "rayon",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
  "tracing",
  "ureq 2.12.1",
 ]
@@ -11020,7 +11038,7 @@ dependencies = [
  "futures-core",
  "half",
  "hf-hub",
- "lattice-inference",
+ "lattice-inference 0.6.1",
  "md5",
  "memmap2",
  "metal 0.29.0",
@@ -12674,7 +12692,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

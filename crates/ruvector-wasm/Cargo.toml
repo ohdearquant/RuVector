@@ -65,6 +65,12 @@ rand = { workspace = true }
 [features]
 default = []
 simd = ["ruvector-core/simd"]
+# Vectorized distance kernels that actually reach wasm32. `simd` above forwards
+# to SimSIMD, which ruvector-core excludes on wasm32, so a browser build gets the
+# scalar path from it. This one forwards to lattice-embed, whose kernels compile
+# to `simd128`. Build with `RUSTFLAGS="-C target-feature=+simd128"`; without that
+# flag the kernels fall back to scalar and the feature is a no-op.
+lattice-simd = ["ruvector-core/lattice-simd"]
 # Collections and filter features (not available in WASM due to file I/O requirements)
 # These features are provided for completeness but will not work in browser WASM
 collections = ["dep:ruvector-collections", "dep:ruvector-filter"]
