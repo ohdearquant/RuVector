@@ -47,6 +47,24 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Generate embedding vector for the given text
     fn embed(&self, text: &str) -> Result<Vec<f32>>;
 
+    /// Generate an embedding for text that is a **search query**.
+    ///
+    /// Asymmetric embedding models encode queries and passages differently:
+    /// the query side carries an instruction prefix that the passage side must
+    /// not have. `bge-small-en-v1.5` prefixes queries with `"Represent this
+    /// sentence for searching relevant passages: "`, the E5 family uses
+    /// `"query: "` against `"passage: "`. Embedding a query through
+    /// [`embed`](EmbeddingProvider::embed) on such a model lowers
+    /// query-to-passage similarity: nothing errors, retrieval just gets worse.
+    ///
+    /// The default forwards to [`embed`](EmbeddingProvider::embed), which is
+    /// what a symmetric model wants, so existing providers keep their current
+    /// behaviour without changes. Providers backed by an asymmetric model
+    /// should override it.
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed(text)
+    }
+
     /// Get the dimensionality of embeddings produced by this provider
     fn dimensions(&self) -> usize;
 
@@ -1048,6 +1066,17 @@ pub mod lattice_native {
             self.send_request(EmbedKind::Passage, text)
         }
 
+        /// Embed **query** text, applying the model's query instruction when it
+        /// has one.
+        ///
+        /// This is what carries the asymmetry across the trait boundary. The
+        /// inherent [`LatticeEmbedding::embed_query`] is unreachable through an
+        /// `Arc<dyn EmbeddingProvider>`, so without this override every holder
+        /// of a boxed provider embeds queries as passages.
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            LatticeEmbedding::embed_query(self, text)
+        }
+
         fn dimensions(&self) -> usize {
             self.dimensions
         }
@@ -1255,6 +1284,21 @@ mod tests {
         assert_ne!(
             emb1, emb2,
             "Different text should produce different embeddings"
+        );
+    }
+
+    #[test]
+    fn embed_query_defaults_to_embed_for_symmetric_providers() {
+        // A provider that implements only `embed` must be unaffected by the
+        // addition of `embed_query`: the default forwards rather than leaving
+        // a hole. This is what makes the new trait method non-breaking for
+        // every existing implementor, in this crate and downstream.
+        let provider = HashEmbedding::new(128);
+
+        assert_eq!(
+            provider.embed("the cat sat on the mat").unwrap(),
+            provider.embed_query("the cat sat on the mat").unwrap(),
+            "the default embed_query must return exactly what embed returns"
         );
     }
 

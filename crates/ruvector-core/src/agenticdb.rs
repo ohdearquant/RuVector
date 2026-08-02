@@ -315,7 +315,7 @@ impl AgenticDB {
         k: usize,
     ) -> Result<Vec<ReflexionEpisode>> {
         // Generate embedding for query
-        let query_embedding = self.generate_text_embedding(query)?;
+        let query_embedding = self.generate_query_embedding(query)?;
 
         // Search in vector DB
         let results = self.vector_db.search(SearchQuery {
@@ -406,7 +406,7 @@ impl AgenticDB {
 
     /// Search skills by description
     pub fn search_skills(&self, query_description: &str, k: usize) -> Result<Vec<Skill>> {
-        let query_embedding = self.generate_text_embedding(query_description)?;
+        let query_embedding = self.generate_query_embedding(query_description)?;
 
         let results = self.vector_db.search(SearchQuery {
             vector: query_embedding,
@@ -527,7 +527,7 @@ impl AgenticDB {
         gamma: f64,
     ) -> Result<Vec<UtilitySearchResult>> {
         let start_time = std::time::Instant::now();
-        let query_embedding = self.generate_text_embedding(query)?;
+        let query_embedding = self.generate_query_embedding(query)?;
 
         // Get all causal edges
         let results = self.vector_db.search(SearchQuery {
@@ -758,6 +758,16 @@ impl AgenticDB {
     /// ```
     fn generate_text_embedding(&self, text: &str) -> Result<Vec<f32>> {
         self.embedding_provider.embed(text)
+    }
+
+    /// Embed text that is a **search query** rather than stored content.
+    ///
+    /// Asymmetric providers apply a query-side instruction here that they must
+    /// not apply when embedding the documents being searched. Providers without
+    /// one fall back to [`EmbeddingProvider::embed`], so this is identical to
+    /// [`Self::generate_text_embedding`] for them.
+    fn generate_query_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        self.embedding_provider.embed_query(text)
     }
 }
 
@@ -1044,7 +1054,7 @@ impl<'a> SessionStateIndex<'a> {
 
     /// Find relevant past turns based on current context
     pub fn find_relevant_turns(&self, query: &str, k: usize) -> Result<Vec<SessionTurn>> {
-        let query_embedding = self.db.generate_text_embedding(query)?;
+        let query_embedding = self.db.generate_query_embedding(query)?;
         let current_time = chrono::Utc::now().timestamp();
 
         let results = self.db.vector_db.search(SearchQuery {
@@ -1246,7 +1256,7 @@ impl<'a> WitnessLog<'a> {
 
     /// Search witness log semantically
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<WitnessEntry>> {
-        let query_embedding = self.db.generate_text_embedding(query)?;
+        let query_embedding = self.db.generate_query_embedding(query)?;
 
         let results = self.db.vector_db.search(SearchQuery {
             vector: query_embedding,
@@ -1355,6 +1365,8 @@ impl AgenticDB {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embeddings::EmbeddingProvider;
+    use parking_lot::Mutex;
     use tempfile::tempdir;
 
     fn create_test_db() -> Result<AgenticDB> {
@@ -1491,6 +1503,92 @@ mod tests {
 
         let skill_ids = db.auto_consolidate(sequences, 3)?;
         assert_eq!(skill_ids.len(), 2);
+
+        Ok(())
+    }
+
+    /// Records which side of the embedding provider each call landed on.
+    ///
+    /// Both sides return the same vector, so nothing downstream can tell them
+    /// apart by value. Only the recorded call log distinguishes them, which is
+    /// what makes the test below fail if a query path is routed back through
+    /// the passage method.
+    struct SideRecordingProvider {
+        dimensions: usize,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl EmbeddingProvider for SideRecordingProvider {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            self.calls.lock().push("passage");
+            Ok(vec![0.1; self.dimensions])
+        }
+
+        fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            self.calls.lock().push("query");
+            Ok(vec![0.1; self.dimensions])
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        fn name(&self) -> &str {
+            "side-recording"
+        }
+    }
+
+    #[test]
+    fn searches_embed_their_query_on_the_query_side() -> Result<()> {
+        let calls: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let dir = tempdir().unwrap();
+        let mut options = DbOptions::default();
+        options.storage_path = dir.path().join("sides.db").to_string_lossy().to_string();
+        options.dimensions = 128;
+        let db = AgenticDB::with_embedding_provider(
+            options,
+            Arc::new(SideRecordingProvider {
+                dimensions: 128,
+                calls: Arc::clone(&calls),
+            }),
+        )?;
+
+        let drain = || -> Vec<&'static str> { std::mem::take(&mut *calls.lock()) };
+
+        // Stored content is a passage: it must never carry a query instruction.
+        db.store_episode(
+            "task".to_string(),
+            vec!["action".to_string()],
+            vec!["outcome".to_string()],
+            "critique".to_string(),
+        )?;
+        assert_eq!(drain(), ["passage"], "store_episode stores a passage");
+
+        db.session_index("s1", 3600).add_turn(1, "user", "hello")?;
+        assert_eq!(drain(), ["passage"], "add_turn stores a passage");
+
+        db.witness_log().append("agent", "act", "details")?;
+        assert_eq!(drain(), ["passage"], "witness append stores a passage");
+
+        // Every search embeds its query text on the query side.
+        db.retrieve_similar_episodes("q", 5)?;
+        assert_eq!(
+            drain(),
+            ["query"],
+            "retrieve_similar_episodes embeds a query"
+        );
+
+        db.search_skills("q", 5)?;
+        assert_eq!(drain(), ["query"], "search_skills embeds a query");
+
+        db.query_with_utility("q", 5, 1.0, 0.0, 0.0)?;
+        assert_eq!(drain(), ["query"], "query_with_utility embeds a query");
+
+        db.session_index("s1", 3600).find_relevant_turns("q", 5)?;
+        assert_eq!(drain(), ["query"], "find_relevant_turns embeds a query");
+
+        db.witness_log().search("q", 5)?;
+        assert_eq!(drain(), ["query"], "witness search embeds a query");
 
         Ok(())
     }
