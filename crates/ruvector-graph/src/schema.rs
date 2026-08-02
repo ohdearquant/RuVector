@@ -91,16 +91,25 @@ impl DistanceMetric {
         match self {
             DistanceMetric::DotProduct => dot(query, candidate),
             DistanceMetric::Cosine => {
+                // Takes the precomputed `query_norm` rather than recomputing
+                // `‖query‖` per candidate, so the hoist this signature exists for
+                // survives, and a caller-supplied norm that differs from `‖query‖`
+                // rescales the result exactly as the scalar arm below does.
+                //
+                // Equal-length guard for the same reason as `dot`: the fused loop
+                // truncates to the shorter slice, the kernel returns 0.0.
+                #[cfg(feature = "lattice-simd")]
+                {
+                    if query.len() == candidate.len() {
+                        return lattice_embed::simd::cosine_similarity_pre_normalized(
+                            query, candidate, query_norm,
+                        );
+                    }
+                }
+
                 // Single fused pass: accumulate q·c and c·c together so the
                 // candidate slice is read once (half the memory traffic of two
                 // separate `dot` calls).
-                //
-                // Deliberately left scalar even under `lattice-simd`. A kernel
-                // cosine takes only `(a, b)` and recomputes the query norm per
-                // candidate, which would discard the `query_norm` hoist this
-                // signature exists for, and would silently ignore a caller-supplied
-                // `query_norm` that differs from `‖query‖`. Vectorizing this arm
-                // needs a kernel that accepts a precomputed query norm.
                 let n = query.len().min(candidate.len());
                 let mut qc = 0.0f32;
                 let mut cc = 0.0f32;
@@ -175,8 +184,8 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     // With `lattice-simd`, use explicit kernels rather than relying on
     // autovectorization. This stays WASM-safe and no-feature-build-safe, the two
     // properties that kept `simsimd` out of this layer: the dependency is
-    // optional, and its kernels compile to `simd128` on wasm32 where `simsimd`
-    // is unavailable.
+    // optional, and its kernels compile to `simd128` on wasm32 — where the
+    // SimSIMD-backed paths are cfg'd out and fall back to scalar.
     //
     // The equal-length guard is required, not defensive. The iterator form below
     // truncates to the shorter slice, while the kernel returns 0.0 on a length
@@ -753,8 +762,12 @@ mod tests {
                     "dot mismatch dim={dim} seed={seed}: got {got_dot}, want {want_dot}"
                 );
 
-                let want_euc =
-                    -q.iter().zip(&c).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt();
+                let want_euc = -q
+                    .iter()
+                    .zip(&c)
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum::<f32>()
+                    .sqrt();
                 let got_euc = DistanceMetric::Euclidean.score_pre(&q, &c, 0.0);
                 assert!(
                     (got_euc - want_euc).abs() <= 1e-3 * want_euc.abs().max(1.0),
@@ -766,6 +779,35 @@ mod tests {
                 assert!(
                     (qn - want_qn).abs() <= 1e-3 * want_qn.abs().max(1.0),
                     "query_norm mismatch dim={dim} seed={seed}: got {qn}, want {want_qn}"
+                );
+
+                // The cosine score itself, not just its hoisted norm. Reference is
+                // built from the naive sums rather than from `query_norm` above, so
+                // a norm that is wrong in the same direction on both sides cannot
+                // cancel out and pass.
+                let qc: f32 = q.iter().zip(&c).map(|(x, y)| x * y).sum();
+                let cn = c.iter().map(|y| y * y).sum::<f32>().sqrt();
+                let want_cos = if want_qn == 0.0 || cn == 0.0 {
+                    0.0
+                } else {
+                    qc / (want_qn * cn)
+                };
+                let got_cos = DistanceMetric::Cosine.score_pre(&q, &c, qn);
+                assert!(
+                    (got_cos - want_cos).abs() <= 1e-3 * want_cos.abs().max(1.0),
+                    "cosine mismatch dim={dim} seed={seed}: got {got_cos}, want {want_cos}"
+                );
+
+                // A caller-supplied norm that is not `‖query‖` must rescale the
+                // result, not be ignored. This is the property that made a plain
+                // two-argument kernel unusable for this signature, so it is
+                // asserted rather than assumed.
+                let scaled = DistanceMetric::Cosine.score_pre(&q, &c, qn * 2.0);
+                assert!(
+                    (scaled - want_cos / 2.0).abs() <= 1e-3 * (want_cos / 2.0).abs().max(1.0),
+                    "cosine ignored the supplied query_norm dim={dim} seed={seed}: \
+                     got {scaled}, want {}",
+                    want_cos / 2.0
                 );
             }
         }
@@ -790,6 +832,15 @@ mod tests {
         assert!(
             (got - want).abs() < 1e-5,
             "expected truncated euclidean {want}, got {got}"
+        );
+
+        // Cosine truncates too: q·c and ‖c‖ both over the first 3 lanes.
+        let qn = (1.0f32 + 4.0 + 9.0 + 16.0).sqrt();
+        let got = DistanceMetric::Cosine.score_pre(&q, &c, qn);
+        let want = 6.0f32 / (qn * 3.0f32.sqrt());
+        assert!(
+            (got - want).abs() < 1e-5,
+            "expected truncated cosine {want}, got {got}"
         );
     }
 }
