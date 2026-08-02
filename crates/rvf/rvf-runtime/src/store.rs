@@ -403,6 +403,12 @@ impl RvfStore {
             self.vectors.insert_slice(vec_id, vec_data);
         }
 
+        // Re-inserting an id resurrects it. A deletion tombstones the payload that
+        // was there, it does not retire the identifier, so the bit must not outlive
+        // the vector it condemned. Left set, it hides the new vector from every
+        // query, and compact() reads it as dead and physically drops it.
+        self.deletion_bitmap.clear_ids(&valid_ids);
+
         // Keep the in-memory HNSW index in sync with the new vectors.
         {
             let mut guard = self.index.lock().unwrap_or_else(|e| e.into_inner());
@@ -3378,6 +3384,79 @@ mod tests {
         let results = store.query(&query, 10, &QueryOptions::default()).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.id != 2));
+
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn reingest_after_delete_makes_the_id_visible_again() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("reingest.rvf");
+
+        let options = RvfOptions {
+            dimension: 2,
+            metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+        let mut store = RvfStore::create(&path, options).unwrap();
+
+        let original = vec![1.0f32, 0.0];
+        store.ingest_batch(&[&original[..]], &[42], None).unwrap();
+        assert_eq!(store.delete(&[42]).unwrap().deleted, 1);
+
+        // Re-inserting the same id must resurrect it: a deletion is a statement
+        // about the old payload, not a permanent ban on the identifier.
+        let replacement = vec![0.0f32, 1.0];
+        store
+            .ingest_batch(&[&replacement[..]], &[42], None)
+            .unwrap();
+
+        let hits = store
+            .query(&[0.0, 1.0], 1, &QueryOptions::default())
+            .unwrap();
+        assert!(
+            hits.iter().any(|r| r.id == 42),
+            "id 42 stayed soft-deleted after re-ingest, so the new payload is unreachable"
+        );
+
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn compact_keeps_a_vector_reingested_after_delete() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("reingest_compact.rvf");
+
+        let options = RvfOptions {
+            dimension: 2,
+            metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+        let mut store = RvfStore::create(&path, options).unwrap();
+
+        let keep = vec![1.0f32, 0.0];
+        let original = vec![0.0f32, 1.0];
+        store
+            .ingest_batch(&[&keep[..], &original[..]], &[1, 42], None)
+            .unwrap();
+        store.delete(&[42]).unwrap();
+
+        let replacement = vec![0.5f32, 0.5];
+        store
+            .ingest_batch(&[&replacement[..]], &[42], None)
+            .unwrap();
+
+        // Compaction physically drops whatever the bitmap still calls dead, so a
+        // stale bit here destroys live data rather than merely hiding it.
+        store.compact().unwrap();
+
+        let hits = store
+            .query(&[0.5, 0.5], 10, &QueryOptions::default())
+            .unwrap();
+        assert!(
+            hits.iter().any(|r| r.id == 42),
+            "compaction dropped a vector that had been re-ingested after deletion"
+        );
 
         store.close().unwrap();
     }
