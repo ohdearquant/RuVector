@@ -194,19 +194,35 @@ impl FlatVectors {
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "distance vectors must have equal lengths");
 
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[cfg(feature = "lattice-simd")]
+    {
+        lattice_embed::simd::squared_euclidean_distance(a, b)
+    }
+
+    #[cfg(all(
+        not(feature = "lattice-simd"),
+        target_arch = "wasm32",
+        target_feature = "simd128"
+    ))]
     {
         wasm_simd128_l2_squared(a, b)
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), feature = "simd"))]
+    #[cfg(all(
+        not(feature = "lattice-simd"),
+        not(target_arch = "wasm32"),
+        feature = "simd"
+    ))]
     {
         simd_l2_squared(a, b)
     }
 
-    #[cfg(any(
-        all(target_arch = "wasm32", not(target_feature = "simd128")),
-        all(not(target_arch = "wasm32"), not(feature = "simd"))
+    #[cfg(all(
+        not(feature = "lattice-simd"),
+        any(
+            all(target_arch = "wasm32", not(target_feature = "simd128")),
+            all(not(target_arch = "wasm32"), not(feature = "simd"))
+        )
     ))]
     {
         scalar_l2_squared(a, b)
@@ -313,27 +329,51 @@ pub fn wasm_simd128_l2_squared(a: &[f32], b: &[f32]) -> f32 {
 pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "distance vectors must have equal lengths");
 
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[cfg(feature = "lattice-simd")]
+    {
+        // Negated to match the other backends: this returns a distance for a
+        // min-heap, not a similarity. `SpatialSimilarity::inner` is a plain
+        // alias for `dot`, so both sides negate the same raw dot product.
+        -lattice_embed::simd::dot_product(a, b)
+    }
+
+    #[cfg(all(
+        not(feature = "lattice-simd"),
+        target_arch = "wasm32",
+        target_feature = "simd128"
+    ))]
     {
         wasm_simd128_inner_product(a, b)
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), feature = "simd"))]
+    #[cfg(all(
+        not(feature = "lattice-simd"),
+        not(target_arch = "wasm32"),
+        feature = "simd"
+    ))]
     {
         simsimd::SpatialSimilarity::inner(a, b)
             .map(|d| -(d as f32))
             .unwrap_or_else(|| scalar_inner_product(a, b))
     }
 
-    #[cfg(any(
-        all(target_arch = "wasm32", not(target_feature = "simd128")),
-        all(not(target_arch = "wasm32"), not(feature = "simd"))
+    #[cfg(all(
+        not(feature = "lattice-simd"),
+        any(
+            all(target_arch = "wasm32", not(target_feature = "simd128")),
+            all(not(target_arch = "wasm32"), not(feature = "simd"))
+        )
     ))]
     {
         scalar_inner_product(a, b)
     }
 }
 
+/// Retained under `lattice-simd` as the reference implementation the parity
+/// test checks the compiled backend against, and as the fallback the other
+/// backends still call. `scalar_l2_squared` is `pub` and so needs no such
+/// annotation.
+#[cfg_attr(feature = "lattice-simd", allow(dead_code))]
 #[inline]
 fn scalar_inner_product(a: &[f32], b: &[f32]) -> f32 {
     let mut s0 = 0.0f32;
@@ -577,6 +617,66 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![4.0, 5.0, 6.0];
         assert!((inner_product(&a, &b) - (-32.0)).abs() < 1e-6);
+    }
+
+    /// Checks whichever backend compiled in against naive scalar references,
+    /// across dimensions chosen to straddle 4/8/16-lane widths **and their
+    /// remainders** so tail handling is exercised. The references are naive
+    /// single-pass loops rather than `scalar_l2_squared` / `scalar_inner_product`,
+    /// which are themselves 4-accumulator implementations, so a reduction-order
+    /// bug in the shared shape cannot hide.
+    ///
+    /// Backend-independent by construction: it covers the SimSIMD path, the
+    /// lattice path, and the plain scalar path. The cross-dimension parity
+    /// tests that existed before this were gated on
+    /// `all(target_arch = "wasm32", target_feature = "simd128")`, so no native
+    /// backend was checked at any dimension wider than 3.
+    #[test]
+    fn backend_matches_scalar_reference() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        fn naive_l2_squared(a: &[f32], b: &[f32]) -> f32 {
+            a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+        }
+
+        fn naive_inner_product(a: &[f32], b: &[f32]) -> f32 {
+            -a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
+        }
+
+        const DIMS: &[usize] = &[
+            0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 384, 768, 1000, 1023, 1024,
+        ];
+
+        // Combined absolute+relative tolerance, numpy `allclose`-style. A flat
+        // absolute bound is not achievable: each backend uses a different
+        // reduction tree, f32 addition is not associative, so reordering shifts
+        // rounding by a few ULPs and that drift grows with accumulated
+        // magnitude. A real bug (wrong lane math, dropped remainder) produces
+        // relative error orders of magnitude above machine epsilon.
+        const ATOL: f32 = 1e-5;
+        const RTOL: f32 = 1e-5;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        for &dim in DIMS {
+            let a: Vec<f32> = (0..dim).map(|_| rng.gen_range(-10.0f32..10.0)).collect();
+            let b: Vec<f32> = (0..dim).map(|_| rng.gen_range(-10.0f32..10.0)).collect();
+
+            for (op, got, want) in [
+                ("l2_squared", l2_squared(&a, &b), naive_l2_squared(&a, &b)),
+                (
+                    "inner_product",
+                    inner_product(&a, &b),
+                    naive_inner_product(&a, &b),
+                ),
+            ] {
+                let bound = ATOL + RTOL * got.abs().max(want.abs());
+                assert!(
+                    (got - want).abs() <= bound,
+                    "{op} dim={dim}: got={got} want={want} bound={bound}"
+                );
+            }
+        }
     }
 
     #[test]
