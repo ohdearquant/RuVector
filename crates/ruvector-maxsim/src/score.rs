@@ -16,15 +16,34 @@ use crate::types::Embedding;
 #[inline]
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dimension mismatch in cosine");
+    cosine_with_lhs_norm(a, b, norm(a))
+}
+
+/// L2 norm of a vector.
+#[inline]
+fn norm(v: &[f32]) -> f32 {
+    let mut acc = 0.0_f32;
+    for &x in v.iter() {
+        acc += x * x;
+    }
+    acc.sqrt()
+}
+
+/// Cosine similarity with the left vector's norm supplied by the caller.
+///
+/// Accumulates in the same order as [`cosine`] and combines the same two
+/// factors into the same denominator, so a caller that passes `norm(a)` gets
+/// bit-identical results to calling [`cosine`] directly.
+#[inline]
+fn cosine_with_lhs_norm(a: &[f32], b: &[f32], norm_a: f32) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dimension mismatch in cosine");
     let mut dot = 0.0_f32;
-    let mut na = 0.0_f32;
     let mut nb = 0.0_f32;
     for (&ai, &bi) in a.iter().zip(b.iter()) {
         dot += ai * bi;
-        na += ai * ai;
         nb += bi * bi;
     }
-    let denom = na.sqrt() * nb.sqrt();
+    let denom = norm_a * nb.sqrt();
     if denom < f32::EPSILON {
         0.0
     } else {
@@ -35,13 +54,18 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// MaxSim score between a multi-vector query and a multi-vector document.
 ///
 /// Time: O(|query_vecs| * |doc_vecs| * D).
+///
+/// Each query token's norm is computed once and reused across every document
+/// token, rather than being recomputed inside each pairwise cosine. The inner
+/// loop therefore does two multiply-adds per dimension instead of three.
 pub fn maxsim(query_vecs: &[Embedding], doc_vecs: &[Embedding]) -> f32 {
     query_vecs
         .iter()
         .map(|q| {
+            let norm_q = norm(q);
             doc_vecs
                 .iter()
-                .map(|d| cosine(q, d))
+                .map(|d| cosine_with_lhs_norm(q, d, norm_q))
                 .fold(f32::NEG_INFINITY, f32::max)
         })
         .sum()
@@ -108,5 +132,95 @@ mod tests {
         let s = maxsim(&q, &d);
         // Each query token matches exactly one doc token → sum = 2.0
         assert!((s - 2.0).abs() < 1e-5, "expected ~2.0, got {s}");
+    }
+
+    /// The pre-hoist cosine, kept verbatim: one fused loop, three
+    /// accumulators, the query norm recomputed for every pair.
+    ///
+    /// Written out rather than delegating to [`cosine`] so that the oracle
+    /// shares no code with what it checks. Delegating would make a bug in the
+    /// shared helper cancel on both sides and the comparison pass anyway.
+    fn cosine_pre_hoist(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot = 0.0_f32;
+        let mut na = 0.0_f32;
+        let mut nb = 0.0_f32;
+        for (&ai, &bi) in a.iter().zip(b.iter()) {
+            dot += ai * bi;
+            na += ai * ai;
+            nb += bi * bi;
+        }
+        let denom = na.sqrt() * nb.sqrt();
+        if denom < f32::EPSILON {
+            0.0
+        } else {
+            dot / denom
+        }
+    }
+
+    /// The pre-hoist formulation, kept verbatim as the oracle.
+    fn maxsim_recomputing_query_norm(q: &[Embedding], d: &[Embedding]) -> f32 {
+        q.iter()
+            .map(|qv| {
+                d.iter()
+                    .map(|dv| cosine_pre_hoist(qv, dv))
+                    .fold(f32::NEG_INFINITY, f32::max)
+            })
+            .sum()
+    }
+
+    fn vecs(count: usize, dim: usize, seed: u32) -> Vec<Embedding> {
+        let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        (0..count)
+            .map(|_| (0..dim).map(|_| next()).collect())
+            .collect()
+    }
+
+    /// Hoisting the query norm must be exact, not merely close.
+    ///
+    /// The norm is accumulated in the same order and multiplied into the same
+    /// denominator either way, so any difference at all would mean the
+    /// refactor changed the arithmetic. Compared bitwise for that reason.
+    #[test]
+    fn hoisting_query_norm_is_bit_exact() {
+        for dim in [1usize, 3, 8, 16, 33, 128, 384] {
+            for (nq, nd) in [(1usize, 1usize), (1, 7), (5, 1), (4, 9)] {
+                let q = vecs(nq, dim, dim as u32);
+                let d = vecs(nd, dim, dim as u32 + 17);
+                let got = maxsim(&q, &d);
+                let want = maxsim_recomputing_query_norm(&q, &d);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "dim={dim} nq={nq} nd={nd}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    /// A zero-magnitude query token must still take the degenerate branch.
+    #[test]
+    fn zero_query_token_scores_zero() {
+        let q = vec![vec![0.0_f32; 8]];
+        let d = vecs(4, 8, 3);
+        assert_eq!(maxsim(&q, &d), 0.0);
+        assert_eq!(maxsim(&q, &d), maxsim_recomputing_query_norm(&q, &d));
+    }
+
+    /// A zero-magnitude document token must not poison the max.
+    #[test]
+    fn zero_doc_token_does_not_poison_max() {
+        let q = vecs(2, 8, 5);
+        let mut d = vecs(3, 8, 11);
+        d.push(vec![0.0_f32; 8]);
+        assert_eq!(
+            maxsim(&q, &d).to_bits(),
+            maxsim_recomputing_query_norm(&q, &d).to_bits()
+        );
     }
 }
