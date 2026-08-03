@@ -23,9 +23,17 @@ use std::collections::HashMap;
 /// test assert *selection*, not just numerical agreement: a scalar reference
 /// can match the kernel's output by construction while the kernel call itself
 /// has been silently reverted to the fallback arm.
+///
+/// Per-thread (rather than a shared global) so that `cargo test`'s default
+/// one-thread-per-test execution can't let one test's cosine calls satisfy
+/// another test's assertion. Holds the actual value the lattice call
+/// returned (not just a flag), set only after that call returns, so the
+/// witness proves what came back rather than merely that a guarded branch
+/// was entered.
 #[cfg(all(test, feature = "lattice-simd"))]
-static COSINE_LATTICE_ROUTE_HIT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static COSINE_LATTICE_ROUTE_HIT: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
 
 /// Declared type of a node/edge property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,11 +117,12 @@ impl DistanceMetric {
                 #[cfg(feature = "lattice-simd")]
                 {
                     if query.len() == candidate.len() {
-                        #[cfg(test)]
-                        COSINE_LATTICE_ROUTE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return lattice_embed::simd::cosine_similarity_pre_normalized(
+                        let result = lattice_embed::simd::cosine_similarity_pre_normalized(
                             query, candidate, query_norm,
                         );
+                        #[cfg(test)]
+                        COSINE_LATTICE_ROUTE_HIT.with(|hit| hit.set(Some(result)));
+                        return result;
                     }
                 }
 
@@ -858,23 +867,48 @@ mod tests {
     /// `lattice-simd` cosine arm to the scalar fallback still produces a
     /// correct score (that's the point of the fallback), so
     /// `test_score_pre_matches_scalar_reference` alone would keep passing.
-    /// This test fails if the equal-length branch stops calling
-    /// `lattice_embed::simd::cosine_similarity_pre_normalized`.
+    ///
+    /// The witness is written only after
+    /// `lattice_embed::simd::cosine_similarity_pre_normalized` returns, and
+    /// this test cross-checks the recorded value bit-for-bit against a
+    /// second, independent direct call to that same kernel function. A
+    /// reversion that swaps the call for an inline scalar computation (even
+    /// one bound to the same local and stored the same way) still shows up
+    /// here: the scalar sum's rounding practically never matches the
+    /// kernel's, so the two values diverge. Reverting the whole arm instead
+    /// leaves the witness unset, which the `.expect` below catches.
     #[cfg(feature = "lattice-simd")]
     #[test]
     fn test_cosine_equal_length_routes_through_lattice_backend() {
-        COSINE_LATTICE_ROUTE_HIT.store(false, std::sync::atomic::Ordering::Relaxed);
+        COSINE_LATTICE_ROUTE_HIT.with(|hit| hit.set(None));
 
-        let q = vec![1.0f32, 2.0, 3.0, 4.0];
-        let c = vec![4.0f32, 3.0, 2.0, 1.0];
+        // dim=17 straddles the 16-lane width with a one-element remainder,
+        // so the kernel's reduction order can't coincidentally match a
+        // sequential scalar sum.
+        let (q, c) = vecs(17, 5);
         let qn = DistanceMetric::Cosine.query_norm(&q);
-        let _ = DistanceMetric::Cosine.score_pre(&q, &c, qn);
+        let got = DistanceMetric::Cosine.score_pre(&q, &c, qn);
 
-        assert!(
-            COSINE_LATTICE_ROUTE_HIT.load(std::sync::atomic::Ordering::Relaxed),
-            "expected the equal-length cosine path to call \
-             lattice_embed::simd::cosine_similarity_pre_normalized; \
-             the scalar fallback ran instead"
+        let recorded = COSINE_LATTICE_ROUTE_HIT.with(|hit| hit.get()).expect(
+            "expected the equal-length cosine path to record a post-call \
+                 witness; the scalar fallback ran instead (or the lattice \
+                 arm never returned through the witnessed path)",
+        );
+        assert_eq!(
+            recorded.to_bits(),
+            got.to_bits(),
+            "witness value diverged from score_pre's own return value"
+        );
+
+        let direct = lattice_embed::simd::cosine_similarity_pre_normalized(&q, &c, qn);
+        assert_eq!(
+            recorded.to_bits(),
+            direct.to_bits(),
+            "expected the equal-length cosine path's witnessed value to \
+             bit-match a fresh, independent call into \
+             lattice_embed::simd::cosine_similarity_pre_normalized; got a \
+             different value, so the scan path did not actually return the \
+             kernel's result"
         );
     }
 }
