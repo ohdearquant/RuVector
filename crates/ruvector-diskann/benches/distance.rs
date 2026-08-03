@@ -7,6 +7,9 @@ use ruvector_diskann::distance::{
 const DIMS: [usize; 4] = [128, 384, 768, 1536];
 const SEED: u64 = 0x5EED_1234_ABCD_EF01;
 const PQ_CODEBOOK_SIZE: usize = 256;
+const PQ_DSUB: usize = 8;
+// (dim, m) pairs at dsub = 8, matching the crate's exercised PQ shape (D=32, M=4).
+const PQ_DIM_M: [(usize, usize); 4] = [(128, 16), (384, 48), (768, 96), (1536, 192)];
 
 fn random_vector(rng: &mut StdRng, dim: usize) -> Vec<f32> {
     (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect()
@@ -64,15 +67,17 @@ fn bench_pq_asymmetric_distance(c: &mut Criterion) {
     let mut group = c.benchmark_group("pq_asymmetric_distance");
     let mut rng = StdRng::seed_from_u64(SEED);
 
-    for &dim in DIMS.iter() {
-        let codes: Vec<u8> = (0..dim)
+    for &(dim, m) in PQ_DIM_M.iter() {
+        debug_assert_eq!(dim, m * PQ_DSUB);
+        let codes: Vec<u8> = (0..m)
             .map(|_| rng.gen_range(0..PQ_CODEBOOK_SIZE) as u8)
             .collect();
-        let table: Vec<f32> = (0..dim * PQ_CODEBOOK_SIZE)
+        let table: Vec<f32> = (0..m * PQ_CODEBOOK_SIZE)
             .map(|_| rng.gen_range(-1.0f32..1.0))
             .collect();
 
-        group.bench_with_input(BenchmarkId::from_parameter(dim), &dim, |bencher, _| {
+        let label = format!("d{dim}_m{m}");
+        group.bench_with_input(BenchmarkId::from_parameter(&label), &m, |bencher, _| {
             bencher.iter(|| {
                 black_box(pq_asymmetric_distance(
                     black_box(&codes),
