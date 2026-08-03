@@ -300,11 +300,26 @@ mod tests {
             ])),
         ]);
 
-        let encoded = serde_json::to_string(&filter).unwrap();
-        assert!(encoded.contains("\"type\":\"and\""));
+        // Exact wire shape, per the `#[serde(tag = "type", rename_all = "snake_case")]`
+        // enum definition: each variant is `{"type": <snake_case variant name>, ...struct fields}`.
+        let expected = json!({
+            "type": "and",
+            "exprs": [
+                {"type": "eq", "field": "status", "value": "active"},
+                {"type": "not", "expr": {
+                    "type": "or",
+                    "exprs": [
+                        {"type": "lt", "field": "score", "value": 10},
+                        {"type": "exists", "field": "banned"},
+                    ]
+                }},
+            ]
+        });
 
-        let decoded: FilterExpression = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.get_fields(), filter.get_fields());
-        assert!(matches!(decoded, FilterExpression::And { .. }));
+        let actual = serde_json::to_value(&filter).unwrap();
+        assert_eq!(actual, expected);
+
+        let decoded: FilterExpression = serde_json::from_value(actual).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), expected);
     }
 }
