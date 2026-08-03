@@ -2,7 +2,8 @@
 # Verifies that ruvector-wasm's `lattice-simd` feature actually vectorizes on
 # wasm32: builds the crate with and without `-C target-feature=+simd128` and
 # counts SIMD128 opcodes in each emitted .wasm artifact. Fails closed on any
-# missing prerequisite, missing/empty artifact, or unmet opcode condition.
+# missing prerequisite, missing/empty artifact, build failure, grep failure,
+# or unmet opcode condition.
 set -euo pipefail
 
 PACKAGE="ruvector-wasm"
@@ -46,26 +47,61 @@ count_simd128_opcodes() {
     exit 1
   fi
 
-  # grep -c exits 1 on zero matches, which is a legitimate count here (the
-  # control arm below), so neutralize that with `|| true` rather than
-  # letting set -e/pipefail treat "no opcodes found" as a script error.
-  local count
-  count="$(grep -Ec '\b(v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\.[a-z_0-9]+' <<<"$disasm" || true)"
+  # grep -c exits 1 on zero matches (a legitimate count: the control arm is
+  # expected to land here) and 0 on a match; capture the real status
+  # ourselves rather than let `|| true` fold every other status (2+: a real
+  # grep failure) into the same "zero" bucket a broken grep invocation would
+  # otherwise be indistinguishable from a genuine zero-opcode build.
+  local count grep_status
+  count="$(grep -Ec '\b(v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\.[a-z_0-9]+' <<<"$disasm")" && grep_status=0 || grep_status=$?
+  if (( grep_status != 0 && grep_status != 1 )); then
+    echo "FAIL: grep exited $grep_status while counting SIMD128 opcodes for '$wasm_file'." >&2
+    exit 1
+  fi
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: grep produced a non-numeric SIMD128 opcode count ('$count') for '$wasm_file'." >&2
+    exit 1
+  fi
+
   echo "$count"
 }
 
 build_artifact() {
   local target_dir="$1"
   local rustflags="$2"
-  CARGO_TARGET_DIR="$target_dir" RUSTFLAGS="$rustflags" \
-    cargo build --release -p "$PACKAGE" --target "$RUST_TARGET" --features "$FEATURE" 1>&2
-  echo "$target_dir/$RUST_TARGET/release/$ARTIFACT"
+  local artifact_path="$target_dir/$RUST_TARGET/release/$ARTIFACT"
+
+  # Delete any artifact left over from a previous run of this script before
+  # building: target dirs persist across invocations, so a failed build must
+  # not be able to fall through to a stale non-empty artifact satisfying the
+  # downstream "exists and is non-empty" check.
+  rm -f "$artifact_path"
+
+  # Check the build's exit status explicitly instead of leaning on `set -e`:
+  # this call sits inside a function invoked via command substitution
+  # (`X="$(build_artifact ...)"`), and a failing non-final command in that
+  # position does not reliably abort the script under `errexit` — only the
+  # function's own final exit status, captured here, does.
+  if ! CARGO_TARGET_DIR="$target_dir" RUSTFLAGS="$rustflags" \
+      cargo build --release -p "$PACKAGE" --target "$RUST_TARGET" --features "$FEATURE" 1>&2; then
+    echo "FAIL: cargo build failed (CARGO_TARGET_DIR=$target_dir, RUSTFLAGS='$rustflags')." >&2
+    return 1
+  fi
+
+  echo "$artifact_path"
 }
 
 echo ""
 echo "== Arm A: RUSTFLAGS='-C target-feature=+simd128', --features $FEATURE =="
-SIMD_WASM="$(build_artifact "$SIMD_TARGET_DIR" "-C target-feature=+simd128")"
+if ! SIMD_WASM="$(build_artifact "$SIMD_TARGET_DIR" "-C target-feature=+simd128")"; then
+  echo "FAIL: build_artifact failed for the +simd128 arm." >&2
+  exit 1
+fi
 SIMD_COUNT="$(count_simd128_opcodes "$SIMD_WASM")"
+if ! [[ "$SIMD_COUNT" =~ ^[0-9]+$ ]]; then
+  echo "FAIL: non-numeric SIMD128 opcode count for the +simd128 arm: '$SIMD_COUNT'." >&2
+  exit 1
+fi
 echo "SIMD128 opcode count: $SIMD_COUNT"
 if (( SIMD_COUNT <= 0 )); then
   echo "FAIL: expected > 0 SIMD128 opcodes with +simd128 and --features $FEATURE, got $SIMD_COUNT." >&2
@@ -74,8 +110,15 @@ fi
 
 echo ""
 echo "== Arm B (control): no target-feature flag, --features $FEATURE =="
-CONTROL_WASM="$(build_artifact "$CONTROL_TARGET_DIR" "")"
+if ! CONTROL_WASM="$(build_artifact "$CONTROL_TARGET_DIR" "")"; then
+  echo "FAIL: build_artifact failed for the control arm." >&2
+  exit 1
+fi
 CONTROL_COUNT="$(count_simd128_opcodes "$CONTROL_WASM")"
+if ! [[ "$CONTROL_COUNT" =~ ^[0-9]+$ ]]; then
+  echo "FAIL: non-numeric SIMD128 opcode count for the control arm: '$CONTROL_COUNT'." >&2
+  exit 1
+fi
 echo "SIMD128 opcode count: $CONTROL_COUNT"
 
 # Without the target-feature flag, lattice-embed's wasm32 kernels take their
