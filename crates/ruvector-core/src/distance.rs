@@ -396,46 +396,42 @@ mod tests {
         }
     }
 
-    /// Test-only mirror of the scalar cosine branch (lines ~100-113 above), kept in sync
-    /// deliberately so the tiny-norm threshold behavior can be pinned regardless of which
-    /// backend (`simd` or `lattice-simd`) is actually compiled in for a given build.
-    fn cosine_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
-        let (mut dot, mut norm_a_sq, mut norm_b_sq) = (0.0f32, 0.0f32, 0.0f32);
-        for (&ai, &bi) in a.iter().zip(b.iter()) {
-            dot += ai * bi;
-            norm_a_sq += ai * ai;
-            norm_b_sq += bi * bi;
-        }
-        let denom = norm_a_sq.sqrt() * norm_b_sq.sqrt();
-        if denom > 1e-8 {
-            1.0 - (dot / denom)
-        } else {
-            1.0
-        }
-    }
-
-    /// Documents an intentional divergence: for a norm strictly between 0 and 1e-8, the
-    /// scalar path's `denom > 1e-8` guard saturates cosine distance at 1.0, while the
+    /// Documents an intentional divergence: when the product of the two vector norms
+    /// (`norm_a_sq.sqrt() * norm_b_sq.sqrt()`) is strictly between 0 and 1e-8, the scalar
+    /// path's `denom > 1e-8` guard saturates cosine distance at 1.0, while the
     /// `lattice-simd` kernel only short-circuits on an *exactly* zero norm and otherwise
     /// computes the real cosine similarity. This is a deliberate contract difference
     /// between the two backends at the sub-1e-8 boundary, not a bug.
+    ///
+    /// The scalar assertion below calls the compiled production `cosine_distance` itself,
+    /// under the same `cfg` as its scalar branch (`distance.rs:103-121`), rather than a
+    /// hand-copied mirror — so a regression in that branch (e.g. dropping the saturation
+    /// guard) fails this test instead of leaving a separately-maintained copy green.
     #[test]
     fn test_tiny_norm_cosine_divergence_is_intentional() {
-        // Norm here is ~1e-9, i.e. nonzero but well under the scalar path's 1e-8 guard.
-        let a = vec![1e-9f32, 0.0, 0.0, 0.0];
-        let b = vec![1e-9f32, 0.0, 0.0, 0.0];
-
-        let scalar = cosine_distance_scalar(&a, &b);
-        assert!(
-            (scalar - 1.0).abs() < 1e-6,
-            "scalar path should saturate at 1.0 below its 1e-8 denom guard, got {scalar}"
-        );
+        #[cfg(all(
+            not(feature = "lattice-simd"),
+            any(not(feature = "simd"), target_arch = "wasm32")
+        ))]
+        {
+            // Each vector's norm is ~1e-9 (nonzero), so their product — the scalar
+            // path's denom — is ~1e-18, well under its 1e-8 guard threshold.
+            let a = vec![1e-9f32, 0.0, 0.0, 0.0];
+            let b = vec![1e-9f32, 0.0, 0.0, 0.0];
+            let scalar = cosine_distance(&a, &b);
+            assert!(
+                (scalar - 1.0).abs() < 1e-6,
+                "scalar path should saturate at 1.0 below its 1e-8 denom guard, got {scalar}"
+            );
+        }
 
         #[cfg(feature = "lattice-simd")]
         {
             // These vectors are parallel, so the true cosine distance is ~0. The lattice
             // kernel does not apply the scalar path's 1e-8 guard, so it should report
-            // that, diverging from the scalar path's 1.0 above.
+            // that, diverging from the scalar path's saturation-at-1.0 behavior above.
+            let a = vec![1e-9f32, 0.0, 0.0, 0.0];
+            let b = vec![1e-9f32, 0.0, 0.0, 0.0];
             let lattice = cosine_distance(&a, &b);
             assert!(
                 lattice.is_finite() && lattice < 0.5,
