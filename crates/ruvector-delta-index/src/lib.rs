@@ -443,14 +443,32 @@ impl DeltaHnsw {
 
             // Add reverse connections
             for &neighbor_idx in &selected {
-                let mut neighbor = self.nodes[neighbor_idx as usize].write();
-                if l < neighbor.neighbors.len() {
-                    neighbor.neighbors[l].push(node_idx);
+                // Take the write guard just long enough to push the new backlink and, if
+                // pruning is needed, copy out the adjacency list plus the neighbor's own
+                // vector. The guard is dropped before `prune_neighbors` (and the `distance`
+                // calls it makes) run, since those take read locks on the same nodes and
+                // parking_lot's RwLock is not reentrant on a single thread.
+                let to_prune = {
+                    let mut neighbor = self.nodes[neighbor_idx as usize].write();
+                    if l < neighbor.neighbors.len() {
+                        neighbor.neighbors[l].push(node_idx);
 
-                    // Prune if over limit
-                    if neighbor.neighbors[l].len() > max_conn {
-                        let node_vec = self.nodes[neighbor_idx as usize].read().vector.clone();
-                        self.prune_neighbors(&mut neighbor.neighbors[l], &node_vec, max_conn);
+                        if neighbor.neighbors[l].len() > max_conn {
+                            Some((neighbor.neighbors[l].clone(), neighbor.vector.clone()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((mut list, node_vec)) = to_prune {
+                    self.prune_neighbors(&mut list, &node_vec, max_conn);
+
+                    let mut neighbor = self.nodes[neighbor_idx as usize].write();
+                    if l < neighbor.neighbors.len() {
+                        neighbor.neighbors[l] = list;
                     }
                 }
             }
@@ -776,5 +794,41 @@ mod tests {
 
         let results = index.search(&[0.0, 1.0, 0.0, 0.0], 10).unwrap();
         assert!(results.iter().all(|r| r.id != "b"));
+    }
+
+    /// Regression test for a self-deadlock in `connect_node`'s reverse-connection loop:
+    /// pruning a neighbor's adjacency list used to take a second lock (directly, and via
+    /// `distance` inside `prune_neighbors`) on a node whose write guard was already held
+    /// on the same thread. `parking_lot::RwLock` is not reentrant, so that hung forever.
+    /// Uses a small `m0`/`m` so pruning is reached almost immediately, and runs the insert
+    /// loop on a background thread with a bounded `recv_timeout` so a regression fails the
+    /// test instead of hanging the test runner.
+    #[test]
+    fn test_connect_node_reverse_prune_no_deadlock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let config = DeltaHnswConfig {
+                m: 4,
+                m0: 4,
+                ..DeltaHnswConfig::default()
+            };
+            let mut index = DeltaHnsw::new(8, config);
+
+            for i in 0..50 {
+                let vec = random_vector(8);
+                index.insert(&format!("v{}", i), vec).unwrap();
+            }
+
+            let _ = tx.send(index.len());
+        });
+
+        let len = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("connect_node reverse-connection pruning deadlocked (timed out)");
+
+        assert_eq!(len, 50);
     }
 }
