@@ -16,7 +16,20 @@ use crate::types::Embedding;
 #[inline]
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dimension mismatch in cosine");
-    cosine_with_lhs_norm(a, b, norm(a))
+    let mut dot = 0.0_f32;
+    let mut na = 0.0_f32;
+    let mut nb = 0.0_f32;
+    for (&ai, &bi) in a.iter().zip(b.iter()) {
+        dot += ai * bi;
+        na += ai * ai;
+        nb += bi * bi;
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom < f32::EPSILON {
+        0.0
+    } else {
+        dot / denom
+    }
 }
 
 /// L2 norm of a vector.
@@ -134,35 +147,22 @@ mod tests {
         assert!((s - 2.0).abs() < 1e-5, "expected ~2.0, got {s}");
     }
 
-    /// The pre-hoist cosine, kept verbatim: one fused loop, three
-    /// accumulators, the query norm recomputed for every pair.
+    /// MaxSim recomputed with the naive, un-hoisted formulation: every
+    /// pairwise score goes through the public [`cosine`], recomputing the
+    /// query token's norm on each call instead of once per query token.
     ///
-    /// Written out rather than delegating to [`cosine`] so that the oracle
-    /// shares no code with what it checks. Delegating would make a bug in the
-    /// shared helper cancel on both sides and the comparison pass anyway.
-    fn cosine_pre_hoist(a: &[f32], b: &[f32]) -> f32 {
-        let mut dot = 0.0_f32;
-        let mut na = 0.0_f32;
-        let mut nb = 0.0_f32;
-        for (&ai, &bi) in a.iter().zip(b.iter()) {
-            dot += ai * bi;
-            na += ai * ai;
-            nb += bi * bi;
-        }
-        let denom = na.sqrt() * nb.sqrt();
-        if denom < f32::EPSILON {
-            0.0
-        } else {
-            dot / denom
-        }
-    }
-
-    /// The pre-hoist formulation, kept verbatim as the oracle.
+    /// This is the property that matters after `cosine` went back to a
+    /// single fused pass: [`maxsim`]'s hoist (`norm(q)` once, then
+    /// [`cosine_with_lhs_norm`] per document token) must still agree with
+    /// calling the real `cosine` per pair. The two sides run genuinely
+    /// different code — one composes `norm` + `cosine_with_lhs_norm`, the
+    /// other calls fused `cosine` — so the comparison still guards a real
+    /// invariant instead of comparing a function with a hand-copy of itself.
     fn maxsim_recomputing_query_norm(q: &[Embedding], d: &[Embedding]) -> f32 {
         q.iter()
             .map(|qv| {
                 d.iter()
-                    .map(|dv| cosine_pre_hoist(qv, dv))
+                    .map(|dv| cosine(qv, dv))
                     .fold(f32::NEG_INFINITY, f32::max)
             })
             .sum()
