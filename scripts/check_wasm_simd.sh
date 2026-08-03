@@ -75,7 +75,10 @@ build_artifact() {
   # building: target dirs persist across invocations, so a failed build must
   # not be able to fall through to a stale non-empty artifact satisfying the
   # downstream "exists and is non-empty" check.
-  rm -f "$artifact_path"
+  if ! rm -f "$artifact_path"; then
+    echo "FAIL: could not remove stale artifact '$artifact_path'." >&2
+    return 1
+  fi
 
   # Check the build's exit status explicitly instead of leaning on `set -e`:
   # this call sits inside a function invoked via command substitution
