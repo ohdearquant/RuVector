@@ -9,7 +9,11 @@
 //! `lattice-embed`'s runtime-dispatched kernels (AVX-512F, AVX2, NEON, wasm32
 //! SIMD128, each with its own scalar fallback).
 //!
-//! Both paths return the same values. Every metric keeps the sign and
+//! The two paths do not return bit-identical values: SIMD kernels reduce in a
+//! different order than the scalar loops below, so results can differ by
+//! floating-point rounding. Each routed function documents the bound this
+//! module's tests enforce: relative error `1e-4`, with an absolute floor of
+//! `1e-5` for results near zero. Every metric keeps the sign and
 //! similarity-to-distance conversion this module already defined, and the
 //! degenerate-input branches are unchanged.
 
@@ -34,6 +38,11 @@ pub fn calculate_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> Resul
 }
 
 /// Euclidean distance (L2).
+///
+/// With `lattice-simd` enabled, the result is computed by a SIMD kernel that
+/// reduces in a different order than the scalar loop below, so it may differ
+/// from the scalar result by bounded floating-point rounding: relative error
+/// up to `1e-4`, with an absolute floor of `1e-5` for results near zero.
 #[inline]
 pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(feature = "lattice-simd")]
@@ -79,6 +88,11 @@ fn euclidean_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
 
 /// Cosine distance.
 /// Returns 1 - cosine_similarity to convert similarity to distance
+///
+/// With `lattice-simd` enabled, the result is computed by a SIMD kernel that
+/// reduces in a different order than the scalar loop below, so it may differ
+/// from the scalar result by bounded floating-point rounding: relative error
+/// up to `1e-4`, with an absolute floor of `1e-5` for results near zero.
 #[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(feature = "lattice-simd")]
@@ -137,6 +151,11 @@ fn cosine_similarity_scalar(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Dot product, negated so that a larger similarity is a smaller distance.
+///
+/// With `lattice-simd` enabled, the result is computed by a SIMD kernel that
+/// reduces in a different order than the scalar loop below, so it may differ
+/// from the scalar result by bounded floating-point rounding: relative error
+/// up to `1e-4`, with an absolute floor of `1e-5` for results near zero.
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(feature = "lattice-simd")]
@@ -176,6 +195,11 @@ fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Manhattan distance (L1).
+///
+/// With `lattice-simd` enabled, the result is computed by a SIMD kernel that
+/// reduces in a different order than the scalar loop below, so it may differ
+/// from the scalar result by bounded floating-point rounding: relative error
+/// up to `1e-4`, with an absolute floor of `1e-5` for results near zero.
 #[inline]
 pub fn manhattan_distance(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(feature = "lattice-simd")]
@@ -319,16 +343,34 @@ mod tests {
         acc as f32
     }
 
-    /// Whichever backend is compiled must agree with an f64 reference.
+    /// Bound the parity test enforces between the compiled backend and the
+    /// f64 reference: relative error, with an absolute floor for results
+    /// near zero. This must match the numbers stated in this module's doc
+    /// comments.
+    const REL_TOL: f32 = 1e-4;
+    const ABS_FLOOR: f32 = 1e-5;
+
+    fn assert_within_tolerance(name: &str, dim: usize, seed: u32, got: f32, want: f32) {
+        let tol = ABS_FLOOR.max(REL_TOL * want.abs());
+        assert!(
+            (got - want).abs() <= tol,
+            "{name} dim={dim} seed={seed}: got={got} want={want} diff={} tol={tol}",
+            (got - want).abs()
+        );
+    }
+
+    /// Whichever backend is compiled must agree with an independent f64
+    /// reference within the bound documented on each routed function.
     ///
-    /// Dimensions straddle the manual 8-wide chunk boundary and the 4/8/16-lane
-    /// widths a SIMD backend uses, so both remainder paths are exercised rather
-    /// than assumed. Sign and the similarity-to-distance conversion are part of
-    /// what is compared, not just magnitude.
+    /// Dimensions straddle the manual 8-wide chunk boundary, the 4/8/16-lane
+    /// widths a SIMD backend uses, and include large (384, 1536) and odd
+    /// (385) lengths, so both remainder paths and realistic embedding sizes
+    /// are exercised rather than assumed. Sign and the similarity-to-distance
+    /// conversion are part of what is compared, not just magnitude.
     #[test]
     fn backends_match_reference() {
         for dim in [
-            1usize, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 384, 768,
+            1usize, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 384, 385, 768, 1536,
         ] {
             for seed in 0..4u32 {
                 let (a, b) = pair(dim, seed);
@@ -351,12 +393,116 @@ mod tests {
                         reference_manhattan(&a, &b),
                     ),
                 ] {
-                    assert!(
-                        (got - want).abs() <= 1e-3 * want.abs().max(1.0),
-                        "{name} dim={dim} seed={seed}: {got} vs {want}"
-                    );
+                    assert_within_tolerance(name, dim, seed, got, want);
                 }
             }
+        }
+    }
+
+    /// Public functions must agree with this module's own private scalar
+    /// implementation on NaN, infinities, signed zero, and empty slices —
+    /// whichever backend (`lattice-simd` or scalar) is compiled. This is not
+    /// a tolerance comparison: exceptional-value propagation should be exact
+    /// or explicitly NaN in both paths, so any disagreement is a real bug in
+    /// the routed backend, not rounding.
+    #[test]
+    fn exceptional_inputs_match_scalar() {
+        fn assert_matches_scalar(name: &str, got: f32, scalar: f32) {
+            let matches = if scalar.is_nan() {
+                got.is_nan()
+            } else {
+                got.to_bits() == scalar.to_bits()
+            };
+            assert!(
+                matches,
+                "{name}: routed={got:?} (0x{:08x}) scalar={scalar:?} (0x{:08x}) disagree on an exceptional input",
+                got.to_bits(),
+                scalar.to_bits()
+            );
+        }
+
+        let base: Vec<f32> = (0..64).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let mut nan_v = base.clone();
+        nan_v[10] = f32::NAN;
+        let mut pos_inf_v = base.clone();
+        pos_inf_v[10] = f32::INFINITY;
+        let mut neg_inf_v = base.clone();
+        neg_inf_v[10] = f32::NEG_INFINITY;
+        let mut neg_zero_v = base.clone();
+        neg_zero_v[10] = -0.0;
+        let mut pos_zero_v = base.clone();
+        pos_zero_v[10] = 0.0;
+
+        let cases: [(&str, &[f32], &[f32]); 8] = [
+            ("nan_in_a", &nan_v, &base),
+            ("nan_in_b", &base, &nan_v),
+            ("pos_inf_in_a", &pos_inf_v, &base),
+            ("neg_inf_in_a", &neg_inf_v, &base),
+            ("pos_inf_vs_pos_inf", &pos_inf_v, &pos_inf_v),
+            ("pos_inf_vs_neg_inf", &pos_inf_v, &neg_inf_v),
+            ("signed_zero", &neg_zero_v, &pos_zero_v),
+            ("empty", &[], &[]),
+        ];
+
+        for (name, a, b) in cases {
+            assert_matches_scalar(
+                &format!("euclidean/{name}"),
+                euclidean_distance(a, b),
+                euclidean_distance_scalar(a, b),
+            );
+            assert_matches_scalar(
+                &format!("cosine/{name}"),
+                cosine_similarity(a, b),
+                cosine_similarity_scalar(a, b),
+            );
+            assert_matches_scalar(
+                &format!("dot/{name}"),
+                dot_product(a, b),
+                dot_product_scalar(a, b),
+            );
+            assert_matches_scalar(
+                &format!("manhattan/{name}"),
+                manhattan_distance(a, b),
+                manhattan_distance_scalar(a, b),
+            );
+        }
+    }
+
+    /// Length mismatch, called directly on each public function rather than
+    /// through `calculate_distance`: a longer `b` is silently truncated to
+    /// `a`'s length (documented on the scalar loops), and a shorter `b`
+    /// panics because the scalar loop indexes `b` by `a`'s length. Mismatched
+    /// lengths never route through `lattice-simd` (it requires equal
+    /// lengths), so this behaviour is identical in both build configurations.
+    #[test]
+    fn length_mismatch_direct_call_matches_documented_behaviour() {
+        let long = vec![1.0f32, 2.0, 3.0, 4.0];
+        let short = vec![1.0f32, 2.0];
+
+        for (name, f) in [
+            ("euclidean", euclidean_distance as fn(&[f32], &[f32]) -> f32),
+            ("cosine", cosine_similarity as fn(&[f32], &[f32]) -> f32),
+            ("dot", dot_product as fn(&[f32], &[f32]) -> f32),
+            ("manhattan", manhattan_distance as fn(&[f32], &[f32]) -> f32),
+        ] {
+            // `b` longer than `a`: the loop only walks `a`'s length, so `b`
+            // is silently truncated to `a`'s first elements and the result
+            // matches comparing `a` against that prefix of `b`.
+            let truncated = f(&short, &long);
+            let expected = f(&short, &long[..short.len()]);
+            assert_eq!(
+                truncated, expected,
+                "{name}: longer b should be truncated to a's length"
+            );
+
+            // `b` shorter than `a`: the scalar loop indexes `b` by `a`'s
+            // length and panics out of bounds.
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&long, &short)));
+            assert!(
+                result.is_err(),
+                "{name}: a longer than b should panic on out-of-bounds indexing"
+            );
         }
     }
 
