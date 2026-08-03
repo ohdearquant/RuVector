@@ -838,7 +838,6 @@ pub mod lattice_native {
     use std::thread;
 
     /// Which side of asymmetric retrieval a queued embedding request is for.
-    #[derive(Clone, Copy)]
     enum EmbedKind {
         Query,
         Passage,
