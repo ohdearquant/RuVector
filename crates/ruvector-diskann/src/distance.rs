@@ -1,23 +1,11 @@
 //! Distance computations with SIMD acceleration and optional GPU offload
 //!
-//! Dispatch priority: GPU (if `gpu` feature) → SimSIMD (if `simd` feature, native
-//! NEON/AVX2/AVX-512) → WASM SIMD128 (`wasm32` target with `simd128`
-//! target-feature) → scalar
+//! Dispatch priority: GPU (if `gpu` feature) → lattice-embed (if `lattice-simd`
+//! feature) → SimSIMD (if `simd` feature, native NEON/AVX2/AVX-512) → WASM
+//! SIMD128 (`wasm32` target with `simd128` target-feature) → scalar
 
 use crate::error::{DiskAnnError, Result};
 use memmap2::Mmap;
-
-/// Set from inside the `lattice-simd` dispatch arms, immediately alongside
-/// the real kernel call, so that swapping the arm's body for a scalar/native
-/// fallback (rather than genuinely calling `lattice_embed`) removes the
-/// `store` along with it. Compiled only for `lattice-simd` test builds — zero
-/// footprint elsewhere. See `lattice_backend_is_actually_invoked` below.
-#[cfg(all(test, feature = "lattice-simd"))]
-static LATTICE_L2_INVOKED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(all(test, feature = "lattice-simd"))]
-static LATTICE_INNER_INVOKED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Backing storage for the flat vector slab.
 ///
@@ -201,6 +189,46 @@ impl FlatVectors {
 // Distance functions — auto-dispatch based on features
 // ============================================================================
 
+/// Set from inside [`l2_lattice`]/[`inner_lattice`] below, only after the
+/// real kernel call returns — so a dispatch arm that swaps the wrapper call
+/// for a scalar/native fallback bypasses the flag along with the kernel.
+/// Thread-local (not a shared global) so a sibling test running on another
+/// thread can't set the flag between this test's reset and its assert.
+/// Compiled only for `lattice-simd` test builds — zero footprint elsewhere.
+/// See `lattice_backend_is_actually_invoked` below.
+#[cfg(all(test, feature = "lattice-simd"))]
+thread_local! {
+    static LATTICE_L2_INVOKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LATTICE_INNER_INVOKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sole caller of the `lattice-embed` L2 kernel — the dispatch arm in
+/// [`l2_squared`] can only reach the kernel through this wrapper, so
+/// replacing the arm's call expression with a fallback also removes the
+/// witness store.
+#[cfg(feature = "lattice-simd")]
+#[inline]
+fn l2_lattice(a: &[f32], b: &[f32]) -> f32 {
+    let result = lattice_embed::simd::squared_euclidean_distance(a, b);
+    #[cfg(test)]
+    LATTICE_L2_INVOKED.with(|invoked| invoked.set(true));
+    result
+}
+
+/// Sole caller of the `lattice-embed` dot-product kernel — see
+/// [`l2_lattice`] for why the store lives here rather than inline in the
+/// dispatch arm. Negated to match the other backends: this returns a
+/// distance for a min-heap, not a similarity. `SpatialSimilarity::inner` is a
+/// plain alias for `dot`, so both sides negate the same raw dot product.
+#[cfg(feature = "lattice-simd")]
+#[inline]
+fn inner_lattice(a: &[f32], b: &[f32]) -> f32 {
+    let result = -lattice_embed::simd::dot_product(a, b);
+    #[cfg(test)]
+    LATTICE_INNER_INVOKED.with(|invoked| invoked.set(true));
+    result
+}
+
 /// L2 squared distance — dispatches to best available implementation
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
@@ -208,9 +236,7 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(feature = "lattice-simd")]
     {
-        #[cfg(test)]
-        LATTICE_L2_INVOKED.store(true, std::sync::atomic::Ordering::Relaxed);
-        lattice_embed::simd::squared_euclidean_distance(a, b)
+        l2_lattice(a, b)
     }
 
     #[cfg(all(
@@ -345,12 +371,7 @@ pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(feature = "lattice-simd")]
     {
-        // Negated to match the other backends: this returns a distance for a
-        // min-heap, not a similarity. `SpatialSimilarity::inner` is a plain
-        // alias for `dot`, so both sides negate the same raw dot product.
-        #[cfg(test)]
-        LATTICE_INNER_INVOKED.store(true, std::sync::atomic::Ordering::Relaxed);
-        -lattice_embed::simd::dot_product(a, b)
+        inner_lattice(a, b)
     }
 
     #[cfg(all(
@@ -385,10 +406,10 @@ pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Retained under `lattice-simd` as the reference implementation the parity
-/// test checks the compiled backend against, and as the fallback the other
-/// backends still call. `scalar_l2_squared` is `pub` and so needs no such
-/// annotation.
+/// Retained under `lattice-simd` as the fallback the `simd` backend still
+/// calls if SimSIMD returns `None`. The parity test's reference is the local
+/// `naive_inner_product`, not this function. `scalar_l2_squared` is `pub` and
+/// so needs no such annotation.
 #[cfg_attr(feature = "lattice-simd", allow(dead_code))]
 #[inline]
 fn scalar_inner_product(a: &[f32], b: &[f32]) -> f32 {
@@ -699,17 +720,17 @@ mod tests {
     /// against a naive oracle; scalar and lattice implement the same
     /// arithmetic, so a `lattice-simd` build that silently fell back to the
     /// scalar/native kernel would still pass it. This pins actual backend
-    /// *selection*: it fails if either dispatch arm's lattice call is
-    /// replaced by a fallback route while the feature stays declared, since
-    /// `LATTICE_L2_INVOKED` / `LATTICE_INNER_INVOKED` are only set from
-    /// inside those exact arms, right next to the real call.
+    /// *selection*: it fails if either dispatch arm's call to
+    /// [`l2_lattice`]/[`inner_lattice`] is replaced by a fallback route while
+    /// the feature stays declared, since the witness flags are only set
+    /// inside those wrappers, after the real kernel call returns. Thread-local
+    /// storage means a sibling test running concurrently on another thread
+    /// can't set these flags between this test's reset and its assert.
     #[test]
     #[cfg(feature = "lattice-simd")]
     fn lattice_backend_is_actually_invoked() {
-        use std::sync::atomic::Ordering;
-
-        LATTICE_L2_INVOKED.store(false, Ordering::Relaxed);
-        LATTICE_INNER_INVOKED.store(false, Ordering::Relaxed);
+        LATTICE_L2_INVOKED.with(|invoked| invoked.set(false));
+        LATTICE_INNER_INVOKED.with(|invoked| invoked.set(false));
 
         let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
         let b = vec![6.0f32, 7.0, 8.0, 9.0, 10.0];
@@ -717,11 +738,11 @@ mod tests {
         let _ = inner_product(&a, &b);
 
         assert!(
-            LATTICE_L2_INVOKED.load(Ordering::Relaxed),
+            LATTICE_L2_INVOKED.with(|invoked| invoked.get()),
             "l2_squared did not route through the lattice-embed kernel"
         );
         assert!(
-            LATTICE_INNER_INVOKED.load(Ordering::Relaxed),
+            LATTICE_INNER_INVOKED.with(|invoked| invoked.get()),
             "inner_product did not route through the lattice-embed kernel"
         );
     }
