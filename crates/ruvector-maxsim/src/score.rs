@@ -58,7 +58,11 @@ fn norm(v: &[f32]) -> f32 {
 ///
 /// Accumulates in the same order as [`cosine`] and combines the same two
 /// factors into the same denominator, so a caller that passes `norm(a)` gets
-/// bit-identical results to calling [`cosine`] directly.
+/// bit-identical results to calling [`cosine`] directly — but only when `a`
+/// and `b` have equal length: `norm_a` was computed over the full `a`, so a
+/// truncated zip over `a` and `b` here would combine a full-length norm with
+/// a truncated dot product. Callers with mismatched lengths must use
+/// [`cosine`] (or [`cosine_truncating`]) instead.
 #[inline]
 fn cosine_with_lhs_norm(a: &[f32], b: &[f32], norm_a: f32) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dimension mismatch in cosine");
@@ -76,13 +80,42 @@ fn cosine_with_lhs_norm(a: &[f32], b: &[f32], norm_a: f32) -> f32 {
     }
 }
 
+/// Fused cosine without [`cosine`]'s equal-length precondition: both norms
+/// and the dot product accumulate inside the same `zip`, so mismatched
+/// lengths truncate to the shorter vector rather than panicking in debug
+/// builds. This is [`maxsim`]'s fallback for query/document token pairs of
+/// differing dimension, where the hoisted `norm(q)` (taken over the full
+/// query) would otherwise be combined with a dot product truncated to the
+/// document's length.
+#[inline]
+fn cosine_truncating(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0_f32;
+    let mut na = 0.0_f32;
+    let mut nb = 0.0_f32;
+    for (&ai, &bi) in a.iter().zip(b.iter()) {
+        dot += ai * bi;
+        na += ai * ai;
+        nb += bi * bi;
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom < f32::EPSILON {
+        0.0
+    } else {
+        dot / denom
+    }
+}
+
 /// MaxSim score between a multi-vector query and a multi-vector document.
 ///
 /// Time: O(|query_vecs| * |doc_vecs| * D).
 ///
 /// Each query token's norm is computed once and reused across every document
-/// token, rather than being recomputed inside each pairwise cosine. The inner
-/// loop therefore does two multiply-adds per dimension instead of three.
+/// token of matching dimension, rather than being recomputed inside each
+/// pairwise cosine. The inner loop therefore does two multiply-adds per
+/// dimension instead of three. Pairs whose query and document tokens have
+/// different lengths fall back to [`cosine_truncating`], since the hoisted
+/// query norm is only bit-identical to per-pair cosine when both operands
+/// are the same length.
 pub fn maxsim(query_vecs: &[Embedding], doc_vecs: &[Embedding]) -> f32 {
     query_vecs
         .iter()
@@ -90,7 +123,13 @@ pub fn maxsim(query_vecs: &[Embedding], doc_vecs: &[Embedding]) -> f32 {
             let norm_q = norm(q);
             doc_vecs
                 .iter()
-                .map(|d| cosine_with_lhs_norm(q, d, norm_q))
+                .map(|d| {
+                    if q.len() == d.len() {
+                        cosine_with_lhs_norm(q, d, norm_q)
+                    } else {
+                        cosine_truncating(q, d)
+                    }
+                })
                 .fold(f32::NEG_INFINITY, f32::max)
         })
         .sum()
@@ -282,5 +321,32 @@ mod tests {
         assert_eq!(got, 0.0);
         assert!(got.is_finite());
         assert_eq!(got, maxsim_recomputing_query_norm(&q, &d));
+    }
+
+    /// A query token longer than the document token it is scored against
+    /// must fall back to the pre-hoist, truncating-zip cosine rather than
+    /// combining a norm taken over the full query with a dot product
+    /// truncated to the document's length. q=[3,4,12] vs d=[3,4]: the
+    /// truncating base semantics give dot=25, na=25 (truncated to 2 terms),
+    /// nb=25, so 25/(5*5)=1.0 exactly. The hoisted fast path would instead
+    /// divide by norm(q)=13, giving 25/(13*5)=0.3846....
+    #[test]
+    fn mismatched_query_longer_scores_via_truncating_fallback() {
+        let q = vec![vec![3.0_f32, 4.0, 12.0]];
+        let d = vec![vec![3.0_f32, 4.0]];
+        let got = maxsim(&q, &d);
+        assert_eq!(got, 1.0, "expected exact 1.0, got {got}");
+    }
+
+    /// The opposite mismatch direction — document token longer than the
+    /// query token — must also route through the truncating fallback and
+    /// agree with calling it directly on the same pair.
+    #[test]
+    fn mismatched_document_longer_matches_truncating_cosine() {
+        let q = vec![vec![3.0_f32, 4.0]];
+        let d = vec![vec![3.0_f32, 4.0, 12.0]];
+        let got = maxsim(&q, &d);
+        let want = cosine_truncating(&q[0], &d[0]);
+        assert_eq!(got, want);
     }
 }
