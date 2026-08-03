@@ -838,6 +838,7 @@ pub mod lattice_native {
     use std::thread;
 
     /// Which side of asymmetric retrieval a queued embedding request is for.
+    #[derive(Clone, Copy)]
     enum EmbedKind {
         Query,
         Passage,
@@ -895,6 +896,12 @@ pub mod lattice_native {
         // `request_tx` closes the channel, which ends the worker's `recv`
         // loop and lets the thread exit on its own.
         _worker: thread::JoinHandle<()>,
+        // Test-only observation seam: records which side (`"query"` /
+        // `"passage"`) each `send_request` call was for, so a test can prove
+        // that dispatch through `Arc<dyn EmbeddingProvider>::embed_query`
+        // reaches the query side instead of only comparing output vectors.
+        #[cfg(test)]
+        requested_sides: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl LatticeEmbedding {
@@ -989,6 +996,8 @@ pub mod lattice_native {
                 dimensions: model.dimensions(),
                 request_tx: Mutex::new(request_tx),
                 _worker: worker,
+                #[cfg(test)]
+                requested_sides: Arc::new(Mutex::new(Vec::new())),
             })
         }
 
@@ -1019,6 +1028,15 @@ pub mod lattice_native {
         /// reply. Never calls `block_on` on the caller's thread, so this is
         /// safe to invoke from inside an existing async runtime.
         fn send_request(&self, kind: EmbedKind, text: &str) -> Result<Vec<f32>> {
+            #[cfg(test)]
+            {
+                let side = match kind {
+                    EmbedKind::Query => "query",
+                    EmbedKind::Passage => "passage",
+                };
+                self.requested_sides.lock().unwrap().push(side);
+            }
+
             let (reply_tx, reply_rx) = mpsc::channel();
             let request = EmbedRequest {
                 kind,
@@ -1245,6 +1263,36 @@ pub mod lattice_native {
                     expected_passage_prefix
                 );
             }
+        }
+
+        /// Regression test for the trait-object bridge: a caller holding only
+        /// `Arc<dyn EmbeddingProvider>` (no concrete `LatticeEmbedding` type)
+        /// must still reach the query side when it calls `embed_query`. The
+        /// `SideRecordingProvider`-style tests elsewhere in the crate use a
+        /// fake provider, so they'd keep passing even if `LatticeEmbedding`'s
+        /// own `embed_query` override were deleted -- they never touch this
+        /// impl. This test uses the real provider and the `requested_sides`
+        /// observation seam so it fails if that override goes away and
+        /// `embed_query` silently falls back to the trait default (which
+        /// forwards to `embed`, the passage side).
+        #[test]
+        fn dyn_provider_embed_query_reaches_query_side() {
+            let lattice = LatticeEmbedding::from_pretrained("bge-small-en-v1.5")
+                .expect("bge-small-en-v1.5 is a native local model");
+            let requested_sides = Arc::clone(&lattice.requested_sides);
+
+            let provider: Arc<dyn EmbeddingProvider> = Arc::new(lattice);
+            provider
+                .embed_query("a trait-object dispatch regression test")
+                .expect("embed_query must succeed through the trait object");
+
+            assert_eq!(
+                *requested_sides.lock().unwrap(),
+                ["query"],
+                "Arc<dyn EmbeddingProvider>::embed_query must dispatch through \
+                 LatticeEmbedding's query-side override; if this fails, the override was \
+                 removed and calls are falling back to the passage side"
+            );
         }
     }
 }

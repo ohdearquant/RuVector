@@ -1570,6 +1570,22 @@ mod tests {
         db.witness_log().append("agent", "act", "details")?;
         assert_eq!(drain(), ["passage"], "witness append stores a passage");
 
+        db.create_skill(
+            "skill".to_string(),
+            "description".to_string(),
+            HashMap::new(),
+            vec!["example".to_string()],
+        )?;
+        assert_eq!(drain(), ["passage"], "create_skill stores a passage");
+
+        db.add_causal_edge(
+            vec!["cause".to_string()],
+            vec!["effect".to_string()],
+            0.9,
+            "context".to_string(),
+        )?;
+        assert_eq!(drain(), ["passage"], "add_causal_edge stores a passage");
+
         // Every search embeds its query text on the query side.
         db.retrieve_similar_episodes("q", 5)?;
         assert_eq!(
