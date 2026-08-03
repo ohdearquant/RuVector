@@ -445,9 +445,11 @@ impl DeltaHnsw {
             for &neighbor_idx in &selected {
                 // Take the write guard just long enough to push the new backlink and, if
                 // pruning is needed, copy out the adjacency list plus the neighbor's own
-                // vector. The guard is dropped before `prune_neighbors` (and the `distance`
-                // calls it makes) run, since those take read locks on the same nodes and
-                // parking_lot's RwLock is not reentrant on a single thread.
+                // vector. Reading that vector through a second `read()` on this same node
+                // deadlocked: parking_lot's RwLock is not reentrant. `prune_neighbors` is
+                // also called after the guard is dropped, since the `distance` calls it
+                // makes read every node in the list it is pruning, which would take the
+                // same lock again for any list that contains its own owner.
                 let to_prune = {
                     let mut neighbor = self.nodes[neighbor_idx as usize].write();
                     if l < neighbor.neighbors.len() {
@@ -796,13 +798,13 @@ mod tests {
         assert!(results.iter().all(|r| r.id != "b"));
     }
 
-    /// Regression test for a self-deadlock in `connect_node`'s reverse-connection loop:
-    /// pruning a neighbor's adjacency list used to take a second lock (directly, and via
-    /// `distance` inside `prune_neighbors`) on a node whose write guard was already held
-    /// on the same thread. `parking_lot::RwLock` is not reentrant, so that hung forever.
-    /// Uses a small `m0`/`m` so pruning is reached almost immediately, and runs the insert
-    /// loop on a background thread with a bounded `recv_timeout` so a regression fails the
-    /// test instead of hanging the test runner.
+    /// Regression test for a self-deadlock in `connect_node`'s reverse-connection loop.
+    /// Pruning a neighbour's adjacency list used to take a `read()` on the very node whose
+    /// write guard was still held on the same thread, and `parking_lot::RwLock` is not
+    /// reentrant, so that blocked forever. `m0 = 4` makes the sixth insert cross the
+    /// pruning threshold, so the branch is reached deterministically despite the random
+    /// vectors. The insert loop runs on a background thread behind a bounded receive, so
+    /// a regression fails the test instead of hanging the runner.
     #[test]
     fn test_connect_node_reverse_prune_no_deadlock() {
         use std::sync::mpsc;
@@ -817,17 +819,25 @@ mod tests {
             };
             let mut index = DeltaHnsw::new(8, config);
 
-            for i in 0..50 {
-                let vec = random_vector(8);
-                index.insert(&format!("v{}", i), vec).unwrap();
-            }
+            let result = (0..50).try_fold((), |(), i| {
+                index
+                    .insert(&format!("v{}", i), random_vector(8))
+                    .map_err(|e| e.to_string())
+            });
 
-            let _ = tx.send(index.len());
+            let _ = tx.send(result.map(|()| index.len()));
         });
 
-        let len = rx
-            .recv_timeout(Duration::from_secs(15))
-            .expect("connect_node reverse-connection pruning deadlocked (timed out)");
+        // A disconnected channel means the worker panicked, which is a different
+        // failure from the deadlock this test exists to catch. Report them apart.
+        let len = match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Ok(len)) => len,
+            Ok(Err(e)) => panic!("insert failed: {}", e),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("connect_node reverse-connection pruning did not finish in 60s")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("insert worker panicked"),
+        };
 
         assert_eq!(len, 50);
     }
