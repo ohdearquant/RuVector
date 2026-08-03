@@ -186,4 +186,39 @@ mod tests {
         assert_eq!(cosine_distance(&v, &zero), 1.0);
         assert_eq!(cosine_distance(&zero, &zero), 1.0);
     }
+
+    /// Guards against a silent reversion of the `lattice-simd` routing back
+    /// to the scalar loops. `backend_matches_reference` above cannot catch
+    /// that: it would still pass if the routed calls were replaced by the
+    /// scalar functions, since both agree with the f64 reference within
+    /// tolerance. This test instead demands the routed result differ from
+    /// the scalar result bit-for-bit, which only holds if a distinct
+    /// (SIMD-ordered) summation actually ran. If the lattice calls at the
+    /// routing sites are ever swapped back for `l2_squared_scalar` / the
+    /// inline scalar sum, `l2_squared` and the dot product become the exact
+    /// same computation as their scalar counterparts and this test fails.
+    #[cfg(feature = "lattice-simd")]
+    #[test]
+    fn lattice_backend_is_actually_selected() {
+        let (a, b) = pair(768, 7);
+
+        let l2_scalar = l2_squared_scalar(&a, &b);
+        let l2_routed = l2_squared(&a, &b);
+        assert_ne!(
+            l2_routed.to_bits(),
+            l2_scalar.to_bits(),
+            "l2_squared matched the scalar sum bit-for-bit with lattice-simd \
+             enabled; the routing at distance.rs may have reverted to scalar"
+        );
+
+        let dot_scalar: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let (dot_routed, _, _) = inner_products(&a, &b);
+        assert_ne!(
+            dot_routed.to_bits(),
+            dot_scalar.to_bits(),
+            "cosine's dot product matched the scalar sum bit-for-bit with \
+             lattice-simd enabled; the routing at distance.rs may have \
+             reverted to scalar"
+        );
+    }
 }
