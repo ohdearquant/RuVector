@@ -19,6 +19,14 @@ use crate::types::PropertyValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Test-only witness for which cosine backend `score_pre` actually took. Lets a
+/// test assert *selection*, not just numerical agreement: a scalar reference
+/// can match the kernel's output by construction while the kernel call itself
+/// has been silently reverted to the fallback arm.
+#[cfg(all(test, feature = "lattice-simd"))]
+static COSINE_LATTICE_ROUTE_HIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Declared type of a node/edge property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PropertyType {
@@ -101,6 +109,8 @@ impl DistanceMetric {
                 #[cfg(feature = "lattice-simd")]
                 {
                     if query.len() == candidate.len() {
+                        #[cfg(test)]
+                        COSINE_LATTICE_ROUTE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
                         return lattice_embed::simd::cosine_similarity_pre_normalized(
                             query, candidate, query_norm,
                         );
@@ -841,6 +851,30 @@ mod tests {
         assert!(
             (got - want).abs() < 1e-5,
             "expected truncated cosine {want}, got {got}"
+        );
+    }
+
+    /// Guards *selection*, not just numerical agreement: reverting the
+    /// `lattice-simd` cosine arm to the scalar fallback still produces a
+    /// correct score (that's the point of the fallback), so
+    /// `test_score_pre_matches_scalar_reference` alone would keep passing.
+    /// This test fails if the equal-length branch stops calling
+    /// `lattice_embed::simd::cosine_similarity_pre_normalized`.
+    #[cfg(feature = "lattice-simd")]
+    #[test]
+    fn test_cosine_equal_length_routes_through_lattice_backend() {
+        COSINE_LATTICE_ROUTE_HIT.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let q = vec![1.0f32, 2.0, 3.0, 4.0];
+        let c = vec![4.0f32, 3.0, 2.0, 1.0];
+        let qn = DistanceMetric::Cosine.query_norm(&q);
+        let _ = DistanceMetric::Cosine.score_pre(&q, &c, qn);
+
+        assert!(
+            COSINE_LATTICE_ROUTE_HIT.load(std::sync::atomic::Ordering::Relaxed),
+            "expected the equal-length cosine path to call \
+             lattice_embed::simd::cosine_similarity_pre_normalized; \
+             the scalar fallback ran instead"
         );
     }
 }
