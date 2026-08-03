@@ -9,6 +9,27 @@
 //! small-norm guard live outside it, so both backends take the same branches
 //! and differ only in how the sums are accumulated.
 
+#[cfg(all(test, feature = "lattice-simd"))]
+thread_local! {
+    static LATTICE_L2_WITNESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LATTICE_DOT_WITNESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Routes to `lattice_embed`'s L2 kernel and records that the call returned.
+///
+/// The witness store lives inside this wrapper, not at the call site in
+/// `l2_squared`, so that reverting the call site's expression to the scalar
+/// fallback (while leaving this wrapper and its store untouched) stops the
+/// wrapper from being invoked at all and the witness cannot fire.
+#[cfg(feature = "lattice-simd")]
+#[inline]
+fn l2_lattice(a: &[f32], b: &[f32]) -> f32 {
+    let result = lattice_embed::simd::squared_euclidean_distance(a, b);
+    #[cfg(test)]
+    LATTICE_L2_WITNESS.with(|w| w.set(true));
+    result
+}
+
 /// Compute L2 squared distance between two f32 slices.
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
@@ -21,7 +42,7 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
         // slice, so guarding here keeps the two backends from disagreeing on
         // an input the debug assertion already calls a caller bug.
         if a.len() == b.len() {
-            return lattice_embed::simd::squared_euclidean_distance(a, b);
+            return l2_lattice(a, b);
         }
     }
 
@@ -53,6 +74,20 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot / (norm_a * norm_b)
 }
 
+/// Routes to `lattice_embed`'s dot-product kernel for all three inner
+/// products and records that the calls returned. See `l2_lattice` for why
+/// the store lives in this wrapper rather than at the `inner_products` call
+/// site.
+#[cfg(feature = "lattice-simd")]
+#[inline]
+fn dot_lattice(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    use lattice_embed::simd::dot_product;
+    let result = (dot_product(a, b), dot_product(a, a), dot_product(b, b));
+    #[cfg(test)]
+    LATTICE_DOT_WITNESS.with(|w| w.set(true));
+    result
+}
+
 /// Returns `(dot(a, b), dot(a, a), dot(b, b))`.
 ///
 /// `lattice_embed::simd::cosine_similarity` is deliberately not used here: it
@@ -66,8 +101,7 @@ fn inner_products(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
         // lattice's dot_product returns 0.0 on a length mismatch, which would
         // read as a zero norm and short-circuit to 1.0. Route equal lengths only.
         if a.len() == b.len() {
-            use lattice_embed::simd::dot_product;
-            return (dot_product(a, b), dot_product(a, a), dot_product(b, b));
+            return dot_lattice(a, b);
         }
     }
 
@@ -191,34 +225,30 @@ mod tests {
     /// to the scalar loops. `backend_matches_reference` above cannot catch
     /// that: it would still pass if the routed calls were replaced by the
     /// scalar functions, since both agree with the f64 reference within
-    /// tolerance. This test instead demands the routed result differ from
-    /// the scalar result bit-for-bit, which only holds if a distinct
-    /// (SIMD-ordered) summation actually ran. If the lattice calls at the
-    /// routing sites are ever swapped back for `l2_squared_scalar` / the
-    /// inline scalar sum, `l2_squared` and the dot product become the exact
-    /// same computation as their scalar counterparts and this test fails.
+    /// tolerance, and a host without an accelerated path falls through to a
+    /// `lattice_embed` scalar loop that can equal RuVector's own scalar sum
+    /// bit-for-bit — a bit-inequality assertion would reject that valid
+    /// route. This test instead witnesses that the `lattice_embed` call
+    /// itself returned, independent of what bits it produced.
     #[cfg(feature = "lattice-simd")]
     #[test]
-    fn lattice_backend_is_actually_selected() {
+    fn lattice_backend_is_actually_called() {
+        LATTICE_L2_WITNESS.with(|w| w.set(false));
+        LATTICE_DOT_WITNESS.with(|w| w.set(false));
+
         let (a, b) = pair(768, 7);
+        let _ = l2_squared(&a, &b);
+        let _ = inner_products(&a, &b);
 
-        let l2_scalar = l2_squared_scalar(&a, &b);
-        let l2_routed = l2_squared(&a, &b);
-        assert_ne!(
-            l2_routed.to_bits(),
-            l2_scalar.to_bits(),
-            "l2_squared matched the scalar sum bit-for-bit with lattice-simd \
-             enabled; the routing at distance.rs may have reverted to scalar"
+        assert!(
+            LATTICE_L2_WITNESS.with(|w| w.get()),
+            "l2_squared did not call lattice_embed::simd::squared_euclidean_distance; \
+             the routing at distance.rs may have reverted to scalar"
         );
-
-        let dot_scalar: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-        let (dot_routed, _, _) = inner_products(&a, &b);
-        assert_ne!(
-            dot_routed.to_bits(),
-            dot_scalar.to_bits(),
-            "cosine's dot product matched the scalar sum bit-for-bit with \
-             lattice-simd enabled; the routing at distance.rs may have \
-             reverted to scalar"
+        assert!(
+            LATTICE_DOT_WITNESS.with(|w| w.get()),
+            "inner_products did not call lattice_embed::simd::dot_product; \
+             the routing at distance.rs may have reverted to scalar"
         );
     }
 }
