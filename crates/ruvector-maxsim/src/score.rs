@@ -32,9 +32,21 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only seam counting calls to [`norm`], which `maxsim` uses
+    /// exclusively for the hoisted per-query-token norm. Thread-local (not a
+    /// shared atomic) so parallel test threads never pollute each other's
+    /// count; a given test's `maxsim` call runs synchronously on its own
+    /// thread, so this is race-free without any lock.
+    static QUERY_NORM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// L2 norm of a vector.
 #[inline]
 fn norm(v: &[f32]) -> f32 {
+    #[cfg(test)]
+    QUERY_NORM_CALLS.with(|c| c.set(c.get() + 1));
     let mut acc = 0.0_f32;
     for &x in v.iter() {
         acc += x * x;
@@ -222,5 +234,53 @@ mod tests {
             maxsim(&q, &d).to_bits(),
             maxsim_recomputing_query_norm(&q, &d).to_bits()
         );
+    }
+
+    /// The hoist must retain its shape, not just its output: `maxsim` must
+    /// compute each query token's norm exactly once, no matter how many
+    /// document tokens it is scored against. More than one document token is
+    /// used deliberately — a formulation that recomputes the query norm once
+    /// per document token would tie with the hoisted one when `nd == 1`.
+    #[test]
+    fn hoist_computes_query_norm_once_per_token_regardless_of_doc_count() {
+        let q = vecs(3, 8, 51);
+        let d = vecs(5, 8, 59);
+        QUERY_NORM_CALLS.with(|c| c.set(0));
+        let _ = maxsim(&q, &d);
+        let calls = QUERY_NORM_CALLS.with(|c| c.get());
+        assert_eq!(
+            calls,
+            q.len(),
+            "expected exactly one query-norm computation per query token \
+             regardless of document count, got {calls} for {} query tokens \
+             against {} document tokens",
+            q.len(),
+            d.len()
+        );
+    }
+
+    /// A document containing ONLY a zero-magnitude token must score 0.0 and
+    /// finite, not NaN silently masked by the max-fold's NaN-ignoring
+    /// semantics.
+    #[test]
+    fn zero_only_document_scores_zero_and_finite() {
+        let q = vecs(2, 8, 41);
+        let d = vec![vec![0.0_f32; 8]];
+        let got = maxsim(&q, &d);
+        assert_eq!(got, 0.0);
+        assert!(got.is_finite());
+        assert_eq!(got, maxsim_recomputing_query_norm(&q, &d));
+    }
+
+    /// Every document token being zero-magnitude (not just one among
+    /// otherwise-normal tokens) must still resolve to 0.0 and finite.
+    #[test]
+    fn all_zero_document_tokens_score_zero_and_finite() {
+        let q = vecs(2, 8, 43);
+        let d = vec![vec![0.0_f32; 8]; 4];
+        let got = maxsim(&q, &d);
+        assert_eq!(got, 0.0);
+        assert!(got.is_finite());
+        assert_eq!(got, maxsim_recomputing_query_norm(&q, &d));
     }
 }
