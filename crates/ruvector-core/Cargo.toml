@@ -142,9 +142,11 @@ lattice-embeddings = [
     "dep:tokio",
 ]
 # Route the f32 distance kernels through lattice-embed instead of SimSIMD.
-# Unlike `simd`, this one covers wasm32 (via `simd128`), where SimSIMD is
-# unavailable and the distance path is otherwise scalar. Takes precedence over
-# `simd` where both are enabled. Off by default.
+# Unlike `simd`, this one covers wasm32 (via `simd128`): SimSIMD's call sites
+# are gated off on wasm32 (the simsimd dependency itself still resolves
+# there), so without this feature the generic distance path falls back to
+# scalar on wasm32. Takes precedence over `simd` where both are enabled. Off
+# by default.
 lattice-simd = ["dep:lattice-embed"]
 
 [lib]

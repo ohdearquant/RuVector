@@ -1,14 +1,20 @@
 //! SIMD-optimized distance metrics
 //!
-//! Three mutually exclusive backends, selected at compile time:
+//! For Euclidean, cosine, and dot, three mutually exclusive backends are selected at
+//! compile time:
 //!
 //! - `lattice-simd`: `lattice-embed`'s kernels. Covers wasm32 (`simd128`) as well as
 //!   x86_64 and aarch64, so it is the only backend that vectorizes on wasm.
-//! - `simd` on non-wasm: SimSIMD.
+//! - `simd` on non-wasm: SimSIMD. Its call sites are excluded on wasm32 (the simsimd
+//!   dependency itself still resolves there), so scalar is used on wasm32 unless
+//!   `lattice-simd` is enabled.
 //! - otherwise: the portable scalar path.
 //!
 //! `lattice-simd` takes precedence where both are enabled. The scalar path stays the
 //! reference implementation that the backends are checked against.
+//!
+//! Manhattan is not part of this split: it uses [`crate::simd_intrinsics`]'s
+//! x86_64/aarch64 dispatch by default, regardless of the `simd` feature.
 //!
 //! ## Call sites
 //!
