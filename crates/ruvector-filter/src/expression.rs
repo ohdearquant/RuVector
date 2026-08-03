@@ -64,9 +64,15 @@ pub enum FilterExpression {
     },
 
     // Logical operators
-    And(Vec<FilterExpression>),
-    Or(Vec<FilterExpression>),
-    Not(Box<FilterExpression>),
+    And {
+        exprs: Vec<FilterExpression>,
+    },
+    Or {
+        exprs: Vec<FilterExpression>,
+    },
+    Not {
+        expr: Box<FilterExpression>,
+    },
 
     // Existence check
     Exists {
@@ -176,19 +182,21 @@ impl FilterExpression {
 
     /// Create an AND filter
     pub fn and(filters: Vec<FilterExpression>) -> Self {
-        Self::And(filters)
+        Self::And { exprs: filters }
     }
 
     /// Create an OR filter
     pub fn or(filters: Vec<FilterExpression>) -> Self {
-        Self::Or(filters)
+        Self::Or { exprs: filters }
     }
 
     /// Create a NOT filter
     // Public API constructor mirrors `and`/`or`; not the `std::ops::Not` trait.
     #[allow(clippy::should_implement_trait)]
     pub fn not(filter: FilterExpression) -> Self {
-        Self::Not(Box::new(filter))
+        Self::Not {
+            expr: Box::new(filter),
+        }
     }
 
     /// Create an EXISTS filter
@@ -231,12 +239,12 @@ impl FilterExpression {
             | Self::IsNull { field } => {
                 fields.push(field.clone());
             }
-            Self::And(exprs) | Self::Or(exprs) => {
+            Self::And { exprs } | Self::Or { exprs } => {
                 for expr in exprs {
                     expr.collect_fields(fields);
                 }
             }
-            Self::Not(expr) => {
+            Self::Not { expr } => {
                 expr.collect_fields(fields);
             }
         }
@@ -257,7 +265,7 @@ mod tests {
             FilterExpression::eq("status", json!("active")),
             FilterExpression::gte("age", json!(18)),
         ]);
-        assert!(matches!(filter, FilterExpression::And(_)));
+        assert!(matches!(filter, FilterExpression::And { .. }));
     }
 
     #[test]
@@ -280,5 +288,23 @@ mod tests {
         let json = serde_json::to_string(&filter).unwrap();
         let deserialized: FilterExpression = serde_json::from_str(&json).unwrap();
         assert!(matches!(deserialized, FilterExpression::Eq { .. }));
+    }
+
+    #[test]
+    fn test_logical_operator_round_trip() {
+        let filter = FilterExpression::and(vec![
+            FilterExpression::eq("status", json!("active")),
+            FilterExpression::not(FilterExpression::or(vec![
+                FilterExpression::lt("score", json!(10)),
+                FilterExpression::exists("banned"),
+            ])),
+        ]);
+
+        let encoded = serde_json::to_string(&filter).unwrap();
+        assert!(encoded.contains("\"type\":\"and\""));
+
+        let decoded: FilterExpression = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.get_fields(), filter.get_fields());
+        assert!(matches!(decoded, FilterExpression::And { .. }));
     }
 }
