@@ -9,6 +9,14 @@
 //!
 //! `lattice-simd` takes precedence where both are enabled. The scalar path stays the
 //! reference implementation that the backends are checked against.
+//!
+//! ## Call sites
+//!
+//! The generic [`distance`] function and its four metric-specific adapters below back
+//! the generic distance path (used by, e.g., [`crate::index::flat`]'s `FlatIndex`).
+//! `crate::index::hnsw`'s HNSW index does not go through this module: it dispatches its
+//! own kernels directly via `crate::simd_intrinsics` for every metric, so enabling
+//! `lattice-simd` does not change HNSW's distance evaluations.
 
 use crate::error::{Result, RuvectorError};
 use crate::types::DistanceMetric;
@@ -341,5 +349,98 @@ mod tests {
         let b = vec![1.0, 2.0, 3.0];
         let result = distance(&a, &b, DistanceMetric::Euclidean);
         assert!(result.is_err());
+    }
+
+    /// Recomputes what each adapter's contract says the `lattice-simd` backend must
+    /// produce, straight from `lattice_embed`'s kernels. This is the seam that pins
+    /// backend *selection* (not just arithmetic): the loose `test_backend_matches_scalar_reference`
+    /// tolerance above passes even if an adapter silently fell back to the scalar path,
+    /// but a bit-exact comparison against this function does not, since the scalar path's
+    /// summation order and rounding differ from the lattice kernels'.
+    #[cfg(feature = "lattice-simd")]
+    fn lattice_kernel_result(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
+        match metric {
+            DistanceMetric::Euclidean => lattice_embed::simd::euclidean_distance(a, b),
+            DistanceMetric::Cosine => 1.0 - lattice_embed::simd::cosine_similarity(a, b),
+            DistanceMetric::DotProduct => -lattice_embed::simd::dot_product(a, b),
+            DistanceMetric::Manhattan => lattice_embed::simd::manhattan_distance(a, b),
+        }
+    }
+
+    /// Under `lattice-simd`, every public adapter must dispatch to the lattice kernels
+    /// bit-for-bit. If any one of the four adapters is edited to fall through to its
+    /// scalar or SimSIMD branch instead, this test fails even though the value stays
+    /// numerically close, because the two implementations round differently.
+    #[cfg(feature = "lattice-simd")]
+    #[test]
+    fn test_backend_selection_uses_lattice_simd() {
+        for dim in [1usize, 3, 4, 7, 8, 15, 16, 17, 31, 64, 127, 384, 768] {
+            for seed in 0..4u32 {
+                let (a, b) = vecs(dim, seed);
+
+                for metric in [
+                    DistanceMetric::Euclidean,
+                    DistanceMetric::Cosine,
+                    DistanceMetric::DotProduct,
+                    DistanceMetric::Manhattan,
+                ] {
+                    let got = distance(&a, &b, metric).unwrap();
+                    let want = lattice_kernel_result(&a, &b, metric);
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{metric:?} did not dispatch to the lattice-simd kernel at dim={dim} seed={seed}: got {got}, want {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test-only mirror of the scalar cosine branch (lines ~100-113 above), kept in sync
+    /// deliberately so the tiny-norm threshold behavior can be pinned regardless of which
+    /// backend (`simd` or `lattice-simd`) is actually compiled in for a given build.
+    fn cosine_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
+        let (mut dot, mut norm_a_sq, mut norm_b_sq) = (0.0f32, 0.0f32, 0.0f32);
+        for (&ai, &bi) in a.iter().zip(b.iter()) {
+            dot += ai * bi;
+            norm_a_sq += ai * ai;
+            norm_b_sq += bi * bi;
+        }
+        let denom = norm_a_sq.sqrt() * norm_b_sq.sqrt();
+        if denom > 1e-8 {
+            1.0 - (dot / denom)
+        } else {
+            1.0
+        }
+    }
+
+    /// Documents an intentional divergence: for a norm strictly between 0 and 1e-8, the
+    /// scalar path's `denom > 1e-8` guard saturates cosine distance at 1.0, while the
+    /// `lattice-simd` kernel only short-circuits on an *exactly* zero norm and otherwise
+    /// computes the real cosine similarity. This is a deliberate contract difference
+    /// between the two backends at the sub-1e-8 boundary, not a bug.
+    #[test]
+    fn test_tiny_norm_cosine_divergence_is_intentional() {
+        // Norm here is ~1e-9, i.e. nonzero but well under the scalar path's 1e-8 guard.
+        let a = vec![1e-9f32, 0.0, 0.0, 0.0];
+        let b = vec![1e-9f32, 0.0, 0.0, 0.0];
+
+        let scalar = cosine_distance_scalar(&a, &b);
+        assert!(
+            (scalar - 1.0).abs() < 1e-6,
+            "scalar path should saturate at 1.0 below its 1e-8 denom guard, got {scalar}"
+        );
+
+        #[cfg(feature = "lattice-simd")]
+        {
+            // These vectors are parallel, so the true cosine distance is ~0. The lattice
+            // kernel does not apply the scalar path's 1e-8 guard, so it should report
+            // that, diverging from the scalar path's 1.0 above.
+            let lattice = cosine_distance(&a, &b);
+            assert!(
+                lattice.is_finite() && lattice < 0.5,
+                "lattice path should not saturate at 1.0 for a tiny nonzero norm, got {lattice}"
+            );
+        }
     }
 }
