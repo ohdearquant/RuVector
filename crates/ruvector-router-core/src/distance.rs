@@ -395,6 +395,38 @@ mod tests {
                 ] {
                     assert_within_tolerance(name, dim, seed, got, want);
                 }
+
+                // Directly enforces the bound the rustdoc on each routed
+                // function promises against the scalar path, not just against
+                // the f64 reference: two implementations each within `tol` of
+                // a third can differ from each other by up to `2 * tol`, so
+                // the vs-reference assertions above don't cover this. Under
+                // the default build this compares a function with itself
+                // (diff 0); under `lattice-simd` it is the real check.
+                for (name, got, want) in [
+                    (
+                        "euclidean/routed_vs_scalar",
+                        euclidean_distance(&a, &b),
+                        euclidean_distance_scalar(&a, &b),
+                    ),
+                    (
+                        "cosine/routed_vs_scalar",
+                        cosine_similarity(&a, &b),
+                        cosine_similarity_scalar(&a, &b),
+                    ),
+                    (
+                        "dot/routed_vs_scalar",
+                        dot_product(&a, &b),
+                        dot_product_scalar(&a, &b),
+                    ),
+                    (
+                        "manhattan/routed_vs_scalar",
+                        manhattan_distance(&a, &b),
+                        manhattan_distance_scalar(&a, &b),
+                    ),
+                ] {
+                    assert_within_tolerance(name, dim, seed, got, want);
+                }
             }
         }
     }
