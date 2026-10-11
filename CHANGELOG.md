@@ -5,6 +5,62 @@ All notable changes to RuVector will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [@ruvector/router 0.1.32] - 2026-09-30
+### Fixed
+- `maxElements` was typed and documented as "Maximum number of elements" but
+  was never read: a database created with `maxElements: 5` accepted 12 inserts
+  (#1099). It is now documented as what it is, a **capacity hint that is not a
+  hard limit**, and a new opt-in `enforceMaxElements: true` (Rust:
+  `VectorDbBuilder::enforce_max_elements`) makes it a real bound. An insert
+  that would exceed the bound fails with `VectorDbError::CapacityExceeded`
+  (JS: an `Error` whose message starts `ERR_CAPACITY_EXCEEDED:`), before
+  anything is written; a batch is rejected as a whole. Replacing an existing
+  id never counts against the bound and deleting frees a slot. The check is
+  serialized so concurrent inserts cannot both pass it.
+- Enforcement is opt-in rather than default because the default `maxElements`
+  is 1,000,000: enforcing it unconditionally would start rejecting writes to
+  any existing store past that size whose owner never asked for a limit.
+  `enforceMaxElements` without `maxElements` is rejected as a configuration
+  error.
+
+## [@ruvector/router 0.1.31] - 2026-09-21
+### Fixed
+- Ship the issue #430 HNSW fixes (result-heap eviction order, insert beam width,
+  distance-based pruning, `k > efSearch`) that landed on `main` in May but never
+  reached npm: published 0.1.30 scored recall@10 = 3.6% on 5,000 real MiniLM
+  embeddings, returning neighbours from the last-inserted region regardless of
+  the query.
+### Changed
+- Neighbour selection now uses the HNSW paper's diversity heuristic (Algorithm 4,
+  with kept-pruned fill) for both new-node edges and overflow pruning, instead of
+  "the m closest". On clustered data the closest-m rule left almost no
+  inter-cluster edges, so single-entry-point search stalled inside a cluster
+  (recall@10 0.89 at defaults with clusters inserted contiguously). Measured on
+  5,000 real embeddings: recall@10 1.000 in every configuration tried (from
+  0.96–0.99 at defaults and 0.88–0.92 at m=16), with lower query latency
+  (p95 0.58 ms vs 0.85 ms at defaults). Inserts are 25–30% slower: the
+  heuristic computes candidate-to-kept distances at selection and at each
+  overflow prune, a per-insert cost bounded by `ef_construction × m` that does
+  not grow with corpus size.
+- New regression test pins recall@10 ≥ 0.90 against brute force on clustered
+  data in both contiguous and shuffled insertion order, and fails if results
+  are drawn from the insertion tail — the failure mode uniform-random-vector
+  tests cannot see.
+
+## [ruvector npm 0.3.2] - 2026-09-21
+### Fixed
+- `DbOptions` documented `hnsw: { m, efConstruction, efSearch }` and `path`,
+  but the `VectorDB` wrapper only read `hnswConfig` and `storagePath`, so a
+  caller following the published types had their HNSW settings silently
+  dropped and got the defaults. Both spellings are honoured; a partial `hnsw`
+  merges over the defaults; the canonical name wins if both are passed. The
+  resolution is a pure exported `resolveVectorDbOptions()` with a workflow test.
+- `DbOptions` now documents the canonical native names (`dimensions`,
+  `hnswConfig`, `storagePath`) with the old spellings marked as aliases; the
+  never-implemented `autoPersist` field is gone.
+- `ruvector route info` printed `v0.1.28` for every installed router version
+  (a hardcoded fallback); it now reads the installed package's version.
+
 ## [ruvector npm 0.2.37] - 2026-07-27
 
 ### Fixed

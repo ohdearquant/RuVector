@@ -12,6 +12,7 @@ const { execSync } = require('child_process');
 const assert = require('assert');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 const CLI_DIR = path.join(__dirname, '..');
 const CLI = `node ${path.join(CLI_DIR, 'bin', 'cli.js')}`;
@@ -274,7 +275,42 @@ test('graph --help shows usage', () => {
   const { stdout } = runSafe('graph --help');
   assert(stdout.includes('graph') || stdout.includes('Graph'),
     'Should show graph info');
+  assert(stdout.includes('--path'), 'Should document persistent storage path');
 });
+
+test('graph mutations require a persistent path', () => {
+  const { code, stderr } = runSafe('graph --create Person --id alice');
+  assert.notStrictEqual(code, 0, 'A non-persistent mutation must fail');
+  assert(stderr.includes('--path'), 'Failure should explain how to select storage');
+});
+
+let graphNodeAvailable = false;
+try {
+  require.resolve('@ruvector/graph-node');
+  graphNodeAvailable = true;
+} catch (_) {}
+
+if (graphNodeAvailable) {
+  test('graph create, relate, query, and info execute against selected storage', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ruvector-graph-cli-'));
+    const dbPath = path.join(tmp, 'graph.db');
+    try {
+      // Exercise all handlers on one database instance. Persistence across
+      // process restarts is covered by the native binding's storage tests.
+      const out = run(`graph --path "${dbPath}" --create Person --id alice --properties '{"name":"Alice"}' --relate alice:KNOWS:alice --query "MATCH (n:Person) RETURN n" --info`);
+      assert(out.includes('"operation":"create"') && out.includes('"id":"alice"'));
+      assert(out.includes('"operation":"relate"'));
+      assert(out.includes('"operation": "query"') && out.includes('alice'), 'Query should return the created node');
+      assert(out.includes('"totalNodes": 1'), 'Info should report the node count');
+      assert(out.includes('"totalEdges": 1'), 'Info should report the edge count');
+      assert(fs.existsSync(dbPath), 'Selected persistent storage should be created');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+} else {
+  skip('graph persistent operations', '@ruvector/graph-node is not installed');
+}
 
 test('router --help shows usage', () => {
   const { stdout } = runSafe('router --help');

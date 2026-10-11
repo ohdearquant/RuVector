@@ -1,5 +1,9 @@
 //! DiskANN index — ties together Vamana graph, PQ, and mmap persistence
 
+// Lint suggests `as_chunks`, stable only since Rust 1.88 — past the declared
+// `rust-version = "1.77"`. `unknown_lints` keeps older toolchains quiet.
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
+
 use crate::distance::{l2_squared, FlatVectors, VisitedSet};
 use crate::error::{DiskAnnError, Result};
 use crate::graph::VamanaGraph;

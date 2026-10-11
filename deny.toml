@@ -108,10 +108,13 @@ ignore = [
     # legacy rand internals; modern paths use getrandom directly.
     "RUSTSEC-2025-0124",
 
-    # rustls-pemfile 1.x — unmaintained, replaced by rustls-pki-types'
-    # builtin PEM parser. Transitive via reqwest / tokio-tungstenite.
-    # Migration is a transitive bump; Dependabot tracking.
-    "RUSTSEC-2025-0134",
+    # NOTE: RUSTSEC-2025-0134 (rustls-pemfile 1.x, unmaintained) was
+    # removed from this list once the last rustls-pemfile 1.0.4 edge
+    # left the graph — it came in via reqwest 0.11 -> hyper 0.14, and
+    # that whole chain went away with the h2 RUSTSEC-2026-0258 fix.
+    # Only rustls-pemfile 2.2.0 remains, which the advisory doesn't
+    # cover. Keeping the entry made cargo-deny emit a permanent
+    # `advisory-not-detected` warning.
 
     # ttf-parser — unmaintained (RUSTSEC-2026-0192), "no safe upgrade
     # available" per the advisory itself. Pulled via three unrelated

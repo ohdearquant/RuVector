@@ -4,7 +4,7 @@
 # v0.3.1: Fixes — Cypher self-reference, graph/RDF persistence, SONA dimension panic
 
 ARG PG_VERSION=17
-ARG RUST_VERSION=1.85
+ARG RUST_VERSION=1.86
 
 # ============================================================================
 # Stage 1: Base Builder with Rust and PostgreSQL dev dependencies

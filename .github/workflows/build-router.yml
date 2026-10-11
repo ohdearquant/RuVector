@@ -53,21 +53,21 @@ jobs:
     runs-on: ${{ matrix.settings.host }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '18'
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: stable
           targets: ${{ matrix.settings.target }}
 
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           key: router-${{ matrix.settings.target }}
 
@@ -125,7 +125,7 @@ jobs:
         run: npm test
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: router-${{ matrix.settings.platform }}
           path: router-artifacts/${{ matrix.settings.platform }}/*.node
@@ -138,16 +138,16 @@ jobs:
     if: inputs.publish == true || startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '18'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: artifacts
 
@@ -157,6 +157,32 @@ jobs:
         run: |
           VERSION=$(node -p "require('./npm/packages/router/package.json').version")
           echo "Publishing version: $VERSION"
+
+          # issue #1007: a failed publish (e.g. an auth failure returning E404 on
+          # PUT) must fail the job, not be swallowed. After each publish, poll the
+          # npm registry JSON until the exact version is resolvable (npm view can
+          # 404 during the minute or two of propagation), and fail if it never
+          # appears. A non-zero publish is not fatal on its own — an idempotent
+          # re-run hits a version conflict — so the registry check is the truth.
+          verify_on_registry() {
+            local pkg="$1" ver="$2"
+            local enc="${pkg//\//%2f}"
+            local url="https://registry.npmjs.org/${enc}"
+            local tmp="$RUNNER_TEMP/reg.json"
+            local i
+            for i in $(seq 1 72); do
+              if curl -sfL "$url" -o "$tmp"; then
+                if REG_JSON="$tmp" REG_VER="$ver" node -e 'const d=require(process.env.REG_JSON); process.exit(d.versions && d.versions[process.env.REG_VER] ? 0 : 1)'; then
+                  echo "verified ${pkg}@${ver} on the npm registry"
+                  return 0
+                fi
+              fi
+              echo "waiting for ${pkg}@${ver} to propagate (attempt ${i}/72)..."
+              sleep 10
+            done
+            echo "::error::${pkg}@${ver} did not appear on the npm registry within ~12 minutes of publish"
+            return 1
+          }
 
           for dir in artifacts/router-*/; do
             platform=$(basename "$dir" | sed 's/router-//')
@@ -220,10 +246,16 @@ jobs:
           }
           EOF
 
-            # Publish
-            cd "$PKG_DIR"
-            npm publish --access public || echo "Failed to publish @ruvector/router-${platform}"
-            cd ../..
+            # Publish, then verify on the registry (fail loudly if absent).
+            (
+              cd "$PKG_DIR"
+              if npm publish --access public; then
+                echo "npm publish returned success"
+              else
+                echo "npm publish returned non-zero — verifying on the registry anyway"
+              fi
+            )
+            verify_on_registry "@ruvector/router-${platform}" "$VERSION" || exit 1
           done
 
       - name: Copy binaries to main package
@@ -241,4 +273,33 @@ jobs:
         working-directory: npm/packages/router
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public || echo "Package may already exist"
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          # issue #1007: verify on the registry instead of swallowing a failed
+          # publish. If the version already exists (idempotent re-run), the
+          # registry check passes; if the publish truly failed, it fails the job.
+          verify_on_registry() {
+            local pkg="$1" ver="$2"
+            local enc="${pkg//\//%2f}"
+            local url="https://registry.npmjs.org/${enc}"
+            local tmp="$RUNNER_TEMP/reg.json"
+            local i
+            for i in $(seq 1 72); do
+              if curl -sfL "$url" -o "$tmp"; then
+                if REG_JSON="$tmp" REG_VER="$ver" node -e 'const d=require(process.env.REG_JSON); process.exit(d.versions && d.versions[process.env.REG_VER] ? 0 : 1)'; then
+                  echo "verified ${pkg}@${ver} on the npm registry"
+                  return 0
+                fi
+              fi
+              echo "waiting for ${pkg}@${ver} to propagate (attempt ${i}/72)..."
+              sleep 10
+            done
+            echo "::error::${pkg}@${ver} did not appear on the npm registry within ~12 minutes of publish"
+            return 1
+          }
+          if npm publish --access public; then
+            echo "npm publish returned success"
+          else
+            echo "npm publish returned non-zero — verifying on the registry anyway"
+          fi
+          verify_on_registry "@ruvector/router" "$VERSION" || exit 1
