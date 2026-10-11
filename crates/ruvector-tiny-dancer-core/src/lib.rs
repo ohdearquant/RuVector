@@ -24,6 +24,7 @@ pub mod storage;
 pub mod training;
 pub mod types;
 pub mod uncertainty;
+pub mod voi;
 
 // Re-exports for convenience
 pub use error::{Result, TinyDancerError};
@@ -34,7 +35,9 @@ pub use training::{
 };
 pub use types::{
     Candidate, RouterConfig, RoutingDecision, RoutingMetrics, RoutingRequest, RoutingResponse,
+    VoiGateConfig,
 };
+pub use voi::{decide, observe, Belief, EstimatorSpec, VoiConfig, VoiDecision};
 
 /// Version of the Tiny Dancer library
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

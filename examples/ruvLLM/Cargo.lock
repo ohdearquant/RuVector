@@ -1990,6 +1990,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -2482,7 +2487,7 @@ dependencies = [
  "blake3",
  "chrono",
  "lattice-inference",
- "lru",
+ "lru 0.16.4",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2586,6 +2591,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 dependencies = [
  "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "lru"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
+dependencies = [
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -4004,7 +4018,7 @@ dependencies = [
 
 [[package]]
 name = "ruvector-core"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "anyhow",
  "bincode 2.0.1",
@@ -4022,12 +4036,15 @@ dependencies = [
  "rayon",
  "redb",
  "rkyv",
+ "ruvector-turboquant",
  "serde",
  "serde_json",
+ "sha2",
  "simsimd",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 
@@ -4051,7 +4068,7 @@ dependencies = [
 
 [[package]]
 name = "ruvector-graph"
-version = "2.3.0"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "bincode 2.0.1",
@@ -4060,7 +4077,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hnsw_rs",
- "lru",
+ "lru 0.18.2",
  "lz4",
  "memmap2",
  "moka",
@@ -4103,6 +4120,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruvector-turboquant"
+version = "2.3.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "ruvllm"
 version = "2.0.0"
 dependencies = [
@@ -4123,7 +4148,7 @@ dependencies = [
  "futures",
  "half",
  "hf-hub",
- "lru",
+ "lru 0.18.2",
  "memmap2",
  "napi",
  "napi-derive",
@@ -4140,7 +4165,7 @@ dependencies = [
  "ruvector-gnn",
  "ruvector-graph",
  "ruvector-sona",
- "ruvllm 2.3.0",
+ "ruvllm 2.5.0",
  "serde",
  "serde_json",
  "simsimd",
@@ -4159,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "ruvllm"
-version = "2.3.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5065,6 +5090,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-normalization-alignments"

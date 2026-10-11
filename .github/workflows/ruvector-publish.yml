@@ -33,8 +33,8 @@ jobs:
       run:
         working-directory: npm/packages/ruvector
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
@@ -77,3 +77,18 @@ jobs:
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify on the registry
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          # #1007: the job's conclusion must mean "it is on the registry".
+          VERSION=$(node -p "require('./package.json').version")
+          for i in $(seq 1 72); do
+            if npm view "ruvector@${VERSION}" version >/dev/null 2>&1; then
+              echo "verified ruvector@${VERSION}"; exit 0
+            fi
+            echo "waiting for ruvector@${VERSION} to propagate (attempt ${i}/72)..."
+            sleep 10
+          done
+          echo "::error::ruvector@${VERSION} is not resolvable on npm"
+          exit 1
