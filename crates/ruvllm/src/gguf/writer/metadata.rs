@@ -444,7 +444,6 @@ fn load_tokenizer(
                 "{role}_token_id refers to an unused vocabulary slot"
             )));
         }
-        types[id] = if role == "unk" { 2 } else { 3 };
         let key = match role {
             "pad" => "padding_token_id",
             "unk" => "unknown_token_id",
@@ -517,23 +516,33 @@ fn tokenizer_profile(tokenizer: &Value) -> Result<&'static str> {
                 return Err(invalid("unsupported pre_tokenizer sequence"));
             }
             let split = &parts[0];
-            known_fields(split, &["type", "pattern", "behavior", "invert"], "Split")?;
-            if string(split, "type")? != "Split"
-                || string(split, "behavior")? != "Isolated"
-                || boolean(split, "invert", false)?
-            {
-                return Err(invalid("unsupported BPE Split behavior"));
-            }
-            let pattern = split
-                .get("pattern")
-                .ok_or_else(|| invalid("missing Split pattern"))?;
-            known_fields(pattern, &["Regex"], "Split pattern")?;
-            let regex = string(pattern, "Regex")?;
-            byte_level(&parts[1], false)?;
-            match regex {
-                QWEN_REGEX => "qwen2",
-                LLAMA_REGEX => "llama-bpe",
-                _ => return Err(invalid("unsupported BPE Split regex")),
+            if string(split, "type")? == "Digits" {
+                known_fields(split, &["type", "individual_digits"], "Digits")?;
+                if split.get("individual_digits").and_then(Value::as_bool) != Some(true) {
+                    return Err(invalid("Digits requires individual_digits=true"));
+                }
+                // Digits splits numbers before ByteLevel applies its GPT-2 regex.
+                byte_level(&parts[1], true)?;
+                "smollm"
+            } else {
+                known_fields(split, &["type", "pattern", "behavior", "invert"], "Split")?;
+                if string(split, "type")? != "Split"
+                    || string(split, "behavior")? != "Isolated"
+                    || boolean(split, "invert", false)?
+                {
+                    return Err(invalid("unsupported BPE Split behavior"));
+                }
+                let pattern = split
+                    .get("pattern")
+                    .ok_or_else(|| invalid("missing Split pattern"))?;
+                known_fields(pattern, &["Regex"], "Split pattern")?;
+                let regex = string(pattern, "Regex")?;
+                byte_level(&parts[1], false)?;
+                match regex {
+                    QWEN_REGEX => "qwen2",
+                    LLAMA_REGEX => "llama-bpe",
+                    _ => return Err(invalid("unsupported BPE Split regex")),
+                }
             }
         }
         _ => return Err(invalid("unsupported tokenizer pre_tokenizer")),
@@ -1086,7 +1095,7 @@ mod tests {
             panic!("expected token type array");
         };
         assert_eq!(types[0].as_i64(), Some(1));
-        assert_eq!(types[3].as_i64(), Some(3));
+        assert_eq!(types[3].as_i64(), Some(1));
         assert_eq!(types[5].as_i64(), Some(4));
         assert_eq!(types[6].as_i64(), Some(5));
         assert!(matches!(
@@ -1307,5 +1316,39 @@ mod tests {
     fn rejects_duplicate_keys_in_nested_json() {
         let bytes = br#"{"model":{"vocab":{"a":0,"a":1}}}"#;
         assert!(serde_json::from_slice::<UniqueJson>(bytes).is_err());
+    }
+
+    #[test]
+    fn qwen_added_special_unknown_token_remains_control() {
+        let mut config = config();
+        config["model_type"] = json!("qwen2");
+        config["unk_token_id"] = json!(0);
+        let mut tokenizer = tokenizer();
+        tokenizer["pre_tokenizer"] = split_profile(QWEN_REGEX);
+        tokenizer["added_tokens"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":0,"content":"a","special":true}));
+        tokenizer["model"]["unk_token"] = json!("a");
+        let directory = fixture(&config, &tokenizer);
+        std::fs::write(
+            directory.path().join("tokenizer_config.json"),
+            json!({
+                "unk_token":"a", "added_tokens_decoder":{"0":{"content":"a","special":true}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let model = load(directory.path()).unwrap();
+        let types = model.values["tokenizer.ggml.token_type"]
+            .as_array()
+            .unwrap();
+        assert_eq!(model.values["tokenizer.ggml.pre"].as_str(), Some("qwen2"));
+        assert_eq!(
+            model.values["tokenizer.ggml.unknown_token_id"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(types[0].as_i64(), Some(3));
+        assert_eq!(types[3].as_i64(), Some(1));
     }
 }

@@ -449,8 +449,8 @@ fn assert_metadata(parsed: &Parsed, architecture: &str, format: OutputType) {
         .as_array()
         .unwrap();
     assert_eq!(types.len(), 32);
-    for (id, value) in types.iter().enumerate() {
-        assert_eq!(value.as_u64(), Some(if id < 3 { 3 } else { 1 }));
+    for value in types {
+        assert_eq!(value.as_u64(), Some(1));
     }
     let merges = parsed.metadata["tokenizer.ggml.merges"].as_array().unwrap();
     assert_eq!(merges.len(), 1);
@@ -1175,4 +1175,206 @@ fn q8_default_quantizes_token_embeddings() {
         GgufQuantType::Q8_0
     );
     assert_eq!(parsed.tensor("output.weight").dtype, GgufQuantType::F16);
+}
+
+fn write_smollm_fixture(directory: &Path) -> PathBuf {
+    let metadata: Value =
+        serde_json::from_str(include_str!("fixtures/smollm2_metadata.json")).unwrap();
+    let mut fixture = Fixture::new("llama", FixtureDtype::BF16, 96, false);
+    fixture.config = metadata["config"].clone();
+    for (key, value) in [
+        ("hidden_size", 96),
+        ("intermediate_size", 64),
+        ("num_hidden_layers", 1),
+        ("num_attention_heads", 3),
+        ("num_key_value_heads", 1),
+        ("vocab_size", 32),
+    ] {
+        fixture.config[key] = json!(value);
+    }
+    fixture
+        .tensors
+        .retain(|tensor| tensor.output_name != "output.weight");
+    for tensor in &mut fixture.tensors {
+        if ["blk.0.attn_k.weight", "blk.0.attn_v.weight"].contains(&tensor.output_name.as_str()) {
+            tensor.shape[0] = 32;
+            tensor.values.truncate(32 * 96);
+        }
+    }
+    let source = fixture.write(directory, false);
+    edit_fixture_json(&directory.join("tokenizer.json"), |value| {
+        let mut vocab = Map::new();
+        for token in metadata["tokenizer"]["added_tokens"].as_array().unwrap() {
+            vocab.insert(
+                token["content"].as_str().unwrap().into(),
+                token["id"].clone(),
+            );
+        }
+        for (content, id) in [("a", 17), ("b", 18), ("ab", 19)] {
+            vocab.insert(content.into(), json!(id));
+        }
+        for id in 20..32 {
+            vocab.insert(format!("token{id}"), json!(id));
+        }
+        *value = metadata["tokenizer"].clone();
+        value["model"] = metadata["bpe_options"].clone();
+        value["model"]["vocab"] = Value::Object(vocab);
+        value["model"]["merges"] = json!(["a b"]);
+    });
+    for name in [
+        "tokenizer_config",
+        "special_tokens_map",
+        "generation_config",
+    ] {
+        fs::write(
+            directory.join(format!("{name}.json")),
+            serde_json::to_vec(&metadata[name]).unwrap(),
+        )
+        .unwrap();
+    }
+    source
+}
+
+#[test]
+fn smollm_pretokenizer_profile_is_supported() {
+    let directory = TempDir::new().unwrap();
+    write_smollm_fixture(directory.path());
+    let metadata = metadata::load(directory.path()).unwrap();
+    assert_eq!(
+        metadata.values["tokenizer.ggml.pre"].as_str(),
+        Some("smollm")
+    );
+    assert_eq!(
+        metadata.values["tokenizer.ggml.model"].as_str(),
+        Some("gpt2")
+    );
+    assert_eq!(
+        metadata.values["tokenizer.ggml.add_space_prefix"].as_bool(),
+        Some(false)
+    );
+}
+
+#[test]
+fn unsupported_digits_profiles_leave_no_output() {
+    let byte =
+        json!({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true});
+    let digits = json!({"type":"Digits","individual_digits":true});
+    for parts in [
+        json!([{"type":"Digits","individual_digits":false}, byte]),
+        json!([{"type":"Digits"}, byte]),
+        json!([{"type":"Digits","individual_digits":null}, byte]),
+        json!([byte, digits]),
+        json!([digits, byte, byte]),
+        json!([{"type":"Digits","individual_digits":true,"unknown":false}, byte]),
+        json!([digits, {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]),
+        json!([digits, {"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true}]),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let source_dir = directory.path().join("source");
+        let source = write_smollm_fixture(&source_dir);
+        edit_fixture_json(&source_dir.join("tokenizer.json"), |value| {
+            value["pre_tokenizer"] = json!({"type":"Sequence","pretokenizers":parts});
+        });
+        let before = directory_entries(directory.path());
+        let output = directory.path().join("refused.gguf");
+        let error = convert_safetensors(&source, &output, &WriterOptions::default()).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("unsupported") || message.contains("individual_digits"),
+            "{message}"
+        );
+        assert!(!output.exists());
+        assert_eq!(directory_entries(directory.path()), before);
+    }
+}
+
+#[test]
+fn smollm_full_conversion_preserves_configuration_and_token_types() {
+    for format in [OutputType::F16, OutputType::Q8_0] {
+        let directory = TempDir::new().unwrap();
+        let source_dir = directory.path().join("source");
+        let source = write_smollm_fixture(&source_dir);
+        let output = directory.path().join("smollm.gguf");
+        let summary = convert_safetensors(
+            &source,
+            &output,
+            &WriterOptions {
+                format,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
+        let parsed = Parsed::read(&output);
+        assert_eq!(summary.tensor_count, 11);
+        assert_eq!(summary.output_bytes, fs::metadata(&output).unwrap().len());
+        assert!(!parsed
+            .tensors
+            .iter()
+            .any(|t| t.name == "output.weight" || t.name == "rope_freqs.weight"));
+        assert_eq!(parsed.tensor("blk.0.attn_q.weight").shape, [96, 96]);
+        assert_eq!(parsed.tensor("blk.0.attn_k.weight").shape, [96, 32]);
+        assert_eq!(
+            parsed.metadata["general.architecture"].as_str(),
+            Some("llama")
+        );
+        assert_eq!(parsed.metadata["llama.context_length"].as_u64(), Some(8192));
+        assert_eq!(
+            parsed.metadata["llama.rope.freq_base"].as_f32(),
+            Some(100000.0)
+        );
+        assert_eq!(
+            parsed.metadata["llama.attention.head_count"].as_u64(),
+            Some(3)
+        );
+        assert_eq!(
+            parsed.metadata["llama.attention.head_count_kv"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed.metadata["tokenizer.ggml.pre"].as_str(),
+            Some("smollm")
+        );
+        for (role, id) in [("bos", 1), ("eos", 2), ("unknown", 0), ("padding", 2)] {
+            assert_eq!(
+                parsed.metadata[&format!("tokenizer.ggml.{role}_token_id")].as_u64(),
+                Some(id)
+            );
+        }
+        for role in ["bos", "eos"] {
+            assert_eq!(
+                parsed.metadata[&format!("tokenizer.ggml.add_{role}_token")].as_bool(),
+                Some(false)
+            );
+        }
+        let types = parsed.metadata["tokenizer.ggml.token_type"]
+            .as_array()
+            .unwrap();
+        for (id, kind) in types.iter().enumerate() {
+            assert_eq!(kind.as_i64(), Some(if id < 17 { 3 } else { 1 }));
+        }
+        let reference: Value =
+            serde_json::from_str(include_str!("fixtures/smollm2_metadata.json")).unwrap();
+        assert_eq!(
+            parsed.metadata["tokenizer.chat_template"].as_str(),
+            reference["tokenizer_config"]["chat_template"].as_str()
+        );
+        assert_eq!(
+            parsed.tensor("token_embd.weight").dtype,
+            if format == OutputType::F16 {
+                GgufQuantType::F16
+            } else {
+                GgufQuantType::Q8_0
+            }
+        );
+        assert_eq!(
+            parsed.tensor("output_norm.weight").dtype,
+            GgufQuantType::F32
+        );
+        for tensor in &parsed.tensors {
+            assert!(parsed
+                .values(&tensor.name)
+                .iter()
+                .all(|value| value.is_finite()));
+        }
+    }
 }
