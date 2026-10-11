@@ -50,6 +50,8 @@ impl From<RouterConfig> for CoreRouterConfig {
             circuit_breaker_threshold: config.circuit_breaker_threshold.unwrap_or(5),
             enable_quantization: config.enable_quantization.unwrap_or(true),
             database_path: config.database_path,
+            // VoI escalation gate (ADR-331) is not yet exposed over NAPI.
+            voi: None,
         }
     }
 }

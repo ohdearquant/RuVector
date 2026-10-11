@@ -830,7 +830,7 @@ mod tests {
 
         let result = handler.validate_path("test.db");
         assert!(result.is_ok(), "Should allow relative path within data dir");
-        assert!(result.unwrap().starts_with(dir.path()));
+        assert!(result.unwrap().starts_with(&handler.allowed_data_dir));
     }
 
     #[test]
@@ -886,7 +886,7 @@ mod tests {
             "Should allow path in subdirectory: {:?}",
             result
         );
-        assert!(result.unwrap().starts_with(dir.path()));
+        assert!(result.unwrap().starts_with(&handler.allowed_data_dir));
     }
 
     #[test]

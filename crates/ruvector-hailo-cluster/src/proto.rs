@@ -6,6 +6,11 @@
 
 #![allow(clippy::pedantic)]
 #![allow(missing_docs)]
+// The generated client/server stubs return `Result<_, tonic::Status>`, whose
+// `Err` variant measures 176 bytes. Both the type and the code returning it
+// come from tonic — we cannot box it without hand-editing generated output on
+// every build, and tonic-build offers no hook to reshape the error type.
+#![allow(clippy::result_large_err)]
 
 tonic::include_proto!("ruvector.hailo.v1");
 

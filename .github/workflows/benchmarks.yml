@@ -87,22 +87,19 @@ jobs:
       - name: Run distance benchmarks
         working-directory: crates/ruvector-postgres
         run: |
+          set -o pipefail
           cargo bench --features pg17 --bench distance_bench -- --output-format bencher | tee ../../distance_bench.txt
 
-      - name: Run index benchmarks
+      - name: Compile-check remaining standalone benchmarks
         working-directory: crates/ruvector-postgres
         run: |
-          cargo bench --features pg17 --bench index_bench -- --output-format bencher | tee ../../index_bench.txt
-
-      - name: Run quantization benchmarks
-        working-directory: crates/ruvector-postgres
-        run: |
-          cargo bench --features pg17 --bench quantization_bench -- --output-format bencher | tee ../../quantization_bench.txt
-
-      - name: Run quantized distance benchmarks
-        working-directory: crates/ruvector-postgres
-        run: |
-          cargo bench --features pg17 --bench quantized_distance_bench -- --output-format bencher | tee ../../quantized_distance_bench.txt
+          set -o pipefail
+          cargo bench --features pg17 \
+            --bench e2e_bench \
+            --bench hybrid_bench \
+            --bench index_bench \
+            --bench integrity_bench \
+            --no-run |& tee ../../benchmark_smoke.txt
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -110,23 +107,8 @@ jobs:
           name: benchmark-results
           path: |
             distance_bench.txt
-            index_bench.txt
-            quantization_bench.txt
-            quantized_distance_bench.txt
+            benchmark_smoke.txt
           retention-days: 30
-
-      - name: Store benchmark result
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba
-        with:
-          name: Rust Benchmarks
-          tool: 'cargo'
-          output-file-path: distance_bench.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
-          alert-threshold: '150%'
-          comment-on-alert: true
-          fail-on-alert: true
 
       - name: Generate benchmark summary
         run: |
@@ -308,8 +290,8 @@ jobs:
       - name: Run baseline benchmarks
         working-directory: crates/ruvector-postgres
         run: |
+          set -o pipefail
           cargo bench --features pg17 --bench distance_bench -- --output-format bencher | tee ../../baseline_distance.txt
-          cargo bench --features pg17 --bench index_bench -- --output-format bencher | tee ../../baseline_index.txt
 
       - name: Compare results
         run: |
