@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct MemoryStorage {
     vectors: DashMap<String, Vec<f32>>,
     metadata: DashMap<String, JsonValue>,
+    config: DashMap<String, String>,
     dimensions: usize,
     counter: AtomicU64,
 }
@@ -23,6 +24,7 @@ impl MemoryStorage {
         Ok(Self {
             vectors: DashMap::new(),
             metadata: DashMap::new(),
+            config: DashMap::new(),
             dimensions,
             counter: AtomicU64::new(0),
         })
@@ -156,12 +158,23 @@ impl MemoryStorage {
         self.metadata.clear();
         Ok(())
     }
+
+    /// Store an arbitrary configuration value for this in-memory database instance.
+    pub fn save_config_value(&self, key: &str, value: &str) -> Result<()> {
+        self.config.insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    /// Load a configuration value stored on this in-memory database instance.
+    pub fn load_config_value(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.config.get(key).map(|value| value.clone()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn test_insert_and_get() {
@@ -170,7 +183,10 @@ mod tests {
         let entry = VectorEntry {
             id: Some("test_1".to_string()),
             vector: vec![0.1; 128],
-            metadata: Some(json!({"key": "value"})),
+            metadata: Some(HashMap::from([(
+                "key".to_string(),
+                serde_json::Value::String("value".to_string()),
+            )])),
         };
 
         let id = storage.insert(&entry).unwrap();
