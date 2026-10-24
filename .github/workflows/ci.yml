@@ -17,6 +17,60 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  workspace-membership:
+    name: Workspace membership guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20'
+
+      - name: Check crates/ for orphan crates (PIR #859)
+        run: node scripts/workspace-check.mjs
+
+  adr-numbering:
+    name: ADR numbering guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20'
+
+      # scripts/adr-index.mjs has always exited 1 on a duplicate ADR number,
+      # but nothing invoked it, so duplicates reached review green. See
+      # ADR-316 for the numbering policy.
+      - name: Check docs/adr/ for duplicate ADR numbers (ADR-316)
+        run: node scripts/adr-index.mjs --check
+
+  frozen-weights:
+    name: Frozen-weights structural gate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20'
+
+      - name: Self-test the gate (PIR #841, ADR-313)
+        run: node scripts/frozen-weights-check.mjs --self-test
+
+      - name: Scan evolution-loop mutation surfaces for training/weight APIs
+        run: node scripts/frozen-weights-check.mjs
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-22.04
@@ -86,7 +140,8 @@ jobs:
   # faster test discovery and execution.
   test:
     name: Tests (${{ matrix.name }})
-    runs-on: ubuntu-22.04
+    # ORT prebuilt binaries require glibc 2.38+ and GCC 13 libstdc++.
+    runs-on: ${{ matrix.name == 'core-and-rest' && 'ubuntu-24.04' || 'ubuntu-22.04' }}
     # `core-and-rest` is the catch-all shard and compiles ~50 crates; on a
     # cold cache the build alone has hit ~90min, so headroom matters more
     # than tight feedback for this job. Faster shards still finish in ~10–20m.
@@ -172,12 +227,25 @@ jobs:
               -p mcp-brain
               -p ruvector-decompiler
           - name: core-and-rest-wasm
-            # Iter 232 — split out the 29 *-wasm crates from core-and-rest
+            # Iter 232 — split out the *-wasm crates from core-and-rest
             # because the catch-all shard had grown to 115 crates and was
             # consistently missing the 180min cap (iter-228 + iter-230 +
             # iter-231 all cancelled at the timeout boundary). The wasm
             # crates are a natural sub-group: thin bindings on top of host
             # crates, easy to compile + test in isolation.
+            #
+            # Iter 233 — `ruvllm-wasm` is excluded from native nextest: 11 of
+            # its 195 tests (sona_instant + workers::feature_detect) fail or
+            # SIGABRT on native because they are wasm-target specific and need
+            # wasm-bindgen-test. Surfaced by the iter-232 split; previously
+            # masked by the iter-228..231 timeout cancellations of the mega
+            # shard. Fix is to gate the affected modules behind
+            # `#[cfg(target_arch = "wasm32")]` or migrate them to
+            # wasm-bindgen-test runners.
+            #
+            # NOTE: comments must stay above `packages:`. Inside the folded
+            # scalar they are content, not YAML comments, and the shell
+            # truncates the expanded command line at the first `#`.
             packages: >-
               -p neural-trader-wasm
               -p ruvector-acorn-wasm
@@ -193,6 +261,7 @@ jobs:
               -p ruvector-exotic-wasm
               -p ruvector-fpga-transformer-wasm
               -p ruvector-gnn-wasm
+              -p ruvector-graph-condense-wasm
               -p ruvector-graph-transformer-wasm
               -p ruvector-graph-wasm
               -p ruvector-learning-wasm
@@ -207,15 +276,6 @@ jobs:
               -p ruvector-tiny-dancer-wasm
               -p ruvector-verified-wasm
               -p ruvector-wasm
-              # Iter 233 — `ruvllm-wasm` excluded from native nextest:
-              # 11 of its 195 tests (sona_instant + workers::feature_detect)
-              # fail or SIGABRT on native because they're wasm-target
-              # specific (need wasm-bindgen-test). Surfaced by iter-232's
-              # split; previously masked by the iter-228..231 timeout
-              # cancellations of the megaShard. Tracking as workspace
-              # follow-up — fix is to gate the affected modules behind
-              # `#[cfg(target_arch = "wasm32")]` or migrate to
-              # wasm-bindgen-test runners.
           - name: research-nightly
             # Nightly research PoC crates (iter 240+). Kept in a separate shard
             # so their compile + test time doesn't inflate core-and-rest.
@@ -235,13 +295,109 @@ jobs:
               -p photonlayer-wasm
               -p photonlayer-ruvector
             timeout-minutes: 30
+          - name: core-and-rest-examples
+            # Example and application crates used to live in the catch-all
+            # shard, which now reaches the 240-minute job timeout. Keep them
+            # together in a parallel shard so they still receive tests and
+            # doctests without blocking the core library crates.
+            packages: >-
+              -p a2a-swarm
+              -p boundary-discovery
+              -p brain-boundary-discovery
+              -p climate-consciousness
+              -p cmb-boundary-discovery
+              -p cmb-consciousness
+              -p earthquake-boundary-discovery
+              -p ecosystem-consciousness
+              -p frb-boundary-discovery
+              -p gene-consciousness
+              -p gw-consciousness
+              -p health-boundary-discovery
+              -p infrastructure-boundary-discovery
+              -p market-boundary-discovery
+              -p music-boundary-discovery
+              -p pandemic-boundary-discovery
+              -p quantum-consciousness
+              -p real-eeg-analysis
+              -p real-eeg-multi-seizure
+              -p refrag-pipeline-example
+              -p ruvector-benchmarks
+              -p ruvector-cloudrun-gpu
+              -p ruvector-robotics-examples
+              -p rvf-kernel-optimized
+              -p seizure-clinical-report
+              -p seizure-therapeutic-sim
+              -p seti-boundary-discovery
+              -p seti-exotic-signals
+              -p sky-monitor
+              -p sky-monitor-wasm
+              -p subpolynomial-time-mincut-demo
+              -p temporal-attractor-discovery
+              -p train-discoveries
+              -p verified-applications
+              -p void-boundary-discovery
+              -p weather-boundary-discovery
+          - name: core-platform
+            # Services, distributed infrastructure, and native Node bindings
+            # form a coherent dependency cluster. Keep them out of the
+            # catch-all so its remaining core libraries compile within the
+            # job timeout even on a cold cache.
+            #
+            # `ruvector-delta-index` rejoined after the #825 fix: the hang
+            # was a self-deadlock in connect_node's prune branch (write lock
+            # held while re-read-locking the same node), fixed by borrowing
+            # the vector from the held guard. The suite now carries a seeded,
+            # prune-heavy regression test that completes in under a second.
+            packages: >-
+              -p mcp-brain-server
+              -p mcp-gate
+              -p ruvector-cli
+              -p ruvector-delta-index
+              -p ruvector-cluster
+              -p ruvector-cluster-rag
+              -p ruvector-delta-consensus
+              -p ruvector-delta-core
+              -p ruvector-delta-graph
+              -p ruvector-namespace-merge
+              -p ruvector-raft
+              -p ruvector-replication
+              -p ruvector-router-cli
+              -p ruvector-router-core
+              -p ruvector-router-ffi
+              -p ruvector-server
+              -p ruvector-snapshot
+              -p ruvector-attention-node
+              -p ruvector-diskann-node
+              -p ruvector-gnn-node
+              -p ruvector-graph-node
+              -p ruvector-graph-transformer-node
+              -p ruvector-mincut-node
+              -p ruvector-node
+              -p ruvector-solver-node
+              -p ruvector-tiny-dancer-node
           - name: core-and-rest
             # Everything else: core, delta, server/cluster, etc.
             # Uses --workspace + --exclude to subtract the groups above so we
             # don't have to enumerate ~100 crates by hand.
+            #
+            # The exclude list below subtracts, in order: the nightly research
+            # crates (research-nightly shard, iter 240+), the example and
+            # application crates (core-and-rest-examples), the service,
+            # distributed and Node-binding crates (core-platform), the heavy
+            # long-tail crates (core-and-rest-heavy), the domain shards
+            # (vector-index, rvagent, ruvix, ml-research-*), and the wasm
+            # crates (core-and-rest-wasm). `ruvector-postgres`, `timesfm`,
+            # `ruvllm-wasm`, and the hailo crates are held out of native
+            # nextest entirely. `ruvector-delta-index` runs in core-platform
+            # again since the #825 deadlock fix.
+            #
+            # NOTE: every comment must stay above `packages:`. A `#` inside
+            # the folded scalar is content, not a YAML comment — folding joins
+            # it onto one line and the shell then truncates the expanded
+            # command at the first `#`, silently dropping every --exclude that
+            # follows and running the whole 210-crate workspace instead.
             packages: >-
               --workspace
-              # Nightly research crates run in the research-nightly shard (iter 240+)
               --exclude photonlayer-core
               --exclude photonlayer-bench
               --exclude photonlayer-cli
@@ -254,6 +410,68 @@ jobs:
               --exclude ruvector-hnsw-repair
               --exclude ruvector-coherence-hnsw
               --exclude ruvector-maxsim
+              --exclude a2a-swarm
+              --exclude boundary-discovery
+              --exclude brain-boundary-discovery
+              --exclude climate-consciousness
+              --exclude cmb-boundary-discovery
+              --exclude cmb-consciousness
+              --exclude earthquake-boundary-discovery
+              --exclude ecosystem-consciousness
+              --exclude frb-boundary-discovery
+              --exclude gene-consciousness
+              --exclude gw-consciousness
+              --exclude health-boundary-discovery
+              --exclude infrastructure-boundary-discovery
+              --exclude market-boundary-discovery
+              --exclude music-boundary-discovery
+              --exclude pandemic-boundary-discovery
+              --exclude quantum-consciousness
+              --exclude real-eeg-analysis
+              --exclude real-eeg-multi-seizure
+              --exclude refrag-pipeline-example
+              --exclude ruvector-benchmarks
+              --exclude ruvector-cloudrun-gpu
+              --exclude ruvector-robotics-examples
+              --exclude rvf-kernel-optimized
+              --exclude seizure-clinical-report
+              --exclude seizure-therapeutic-sim
+              --exclude seti-boundary-discovery
+              --exclude seti-exotic-signals
+              --exclude sky-monitor
+              --exclude sky-monitor-wasm
+              --exclude subpolynomial-time-mincut-demo
+              --exclude temporal-attractor-discovery
+              --exclude train-discoveries
+              --exclude verified-applications
+              --exclude void-boundary-discovery
+              --exclude weather-boundary-discovery
+              --exclude mcp-brain-server
+              --exclude mcp-gate
+              --exclude ruvector-cli
+              --exclude ruvector-cluster
+              --exclude ruvector-cluster-rag
+              --exclude ruvector-delta-consensus
+              --exclude ruvector-delta-core
+              --exclude ruvector-delta-graph
+              --exclude ruvector-delta-index
+              --exclude ruvector-namespace-merge
+              --exclude ruvector-raft
+              --exclude ruvector-replication
+              --exclude ruvector-router-cli
+              --exclude ruvector-router-core
+              --exclude ruvector-router-ffi
+              --exclude ruvector-server
+              --exclude ruvector-snapshot
+              --exclude ruvector-attention-node
+              --exclude ruvector-diskann-node
+              --exclude ruvector-gnn-node
+              --exclude ruvector-graph-node
+              --exclude ruvector-graph-transformer-node
+              --exclude ruvector-mincut-node
+              --exclude ruvector-node
+              --exclude ruvector-solver-node
+              --exclude ruvector-tiny-dancer-node
               --exclude ruvector-postgres
               --exclude ruvector-decompiler
               --exclude timesfm
@@ -318,7 +536,7 @@ jobs:
               --exclude ruvector-cnn-wasm
               --exclude ruvector-consciousness-wasm
               --exclude ruvector-dag-wasm
-              --exclude ruvector-decompiler
+              --exclude ruvector-decompiler-wasm
               --exclude timesfm-wasm
               --exclude ruvector-delta-wasm
               --exclude ruvector-domain-expansion-wasm
@@ -326,6 +544,7 @@ jobs:
               --exclude ruvector-exotic-wasm
               --exclude ruvector-fpga-transformer-wasm
               --exclude ruvector-gnn-wasm
+              --exclude ruvector-graph-condense-wasm
               --exclude ruvector-graph-transformer-wasm
               --exclude ruvector-graph-wasm
               --exclude ruvector-learning-wasm

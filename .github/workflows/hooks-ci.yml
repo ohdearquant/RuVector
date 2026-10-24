@@ -76,10 +76,11 @@ jobs:
       - name: Install dependencies
         run: |
           # Copy CLI package to temp location to avoid workspace interference
+          workspace="$PWD"
           cp -r npm/packages/cli /tmp/cli
           cd /tmp/cli
           npm install --ignore-scripts
-          cp -r node_modules $GITHUB_WORKSPACE/npm/packages/cli/
+          cp -r node_modules "$workspace/npm/packages/cli/"
 
       - name: Build CLI
         working-directory: npm/packages/cli
@@ -193,10 +194,11 @@ jobs:
         run: |
           cargo build -p ruvector-cli --release
           # Install CLI deps in temp to avoid workspace interference
+          workspace="$PWD"
           cp -r npm/packages/cli /tmp/cli
           cd /tmp/cli && npm install --ignore-scripts && npm run build
-          cp -r /tmp/cli/node_modules npm/packages/cli/
-          cp -r /tmp/cli/dist npm/packages/cli/
+          cp -r /tmp/cli/node_modules "$workspace/npm/packages/cli/"
+          cp -r /tmp/cli/dist "$workspace/npm/packages/cli/"
 
       - name: Compare command counts
         run: |

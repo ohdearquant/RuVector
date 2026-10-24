@@ -11,14 +11,14 @@ const nativeImport = new Function(
 ) as (specifier: string) => Promise<Record<string, any>>;
 
 export const METAHARNESS_VERSIONS = Object.freeze({
-  metaharness: '0.4.2',
-  darwin: '0.8.0',
-  flywheel: '0.1.7',
-  harness: '0.1.0',
-  router: '0.3.2',
-  redblue: '0.1.4',
+  metaharness: '0.4.7',
+  darwin: '0.9.2',
+  flywheel: '0.1.10',
+  harness: '0.2.0',
+  router: '0.4.0',
+  redblue: '0.1.6',
   weightEft: '0.1.1',
-  workspaceLens: '0.1.1',
+  workspaceLens: '0.1.2',
   workspaceProbe: '0.1.1',
 });
 
@@ -73,7 +73,27 @@ const moduleCache = new Map<string, Promise<Record<string, any>>>();
 function loadPackage(name: string): Promise<Record<string, any>> {
   let pending = moduleCache.get(name);
   if (!pending) {
-    pending = nativeImport(name);
+    pending = nativeImport(name).catch((error: any) => {
+      if (error?.code === 'ERR_MODULE_NOT_FOUND' || error?.code === 'MODULE_NOT_FOUND') {
+        // Per ruflo ADR-150 "MetaHarness Integration Surfaces"
+        // (ruflo/v3/docs/adr/ADR-150-metaharness-integration-surfaces.md, Implemented
+        // 2026-06-16; summarized locally in METAHARNESS-README.md): "@metaharness/*
+        // packages MUST appear in optionalDependencies or peerDependencies (optional),
+        // never in dependencies". ruvector must keep working without the MetaHarness
+        // stack, and callers of a MetaHarness-backed capability get a clear error
+        // naming the missing package.
+        moduleCache.delete(name);
+        const missing = new Error(
+          `Optional MetaHarness package "${name}" is not installed. ` +
+            `Run \`npm install ${name}\` to enable this capability; ` +
+            `ruvector itself works without it (ruflo ADR-150, see METAHARNESS-README.md).`,
+        );
+        (missing as any).code = 'ERR_METAHARNESS_OPTIONAL_MISSING';
+        (missing as any).cause = error;
+        throw missing;
+      }
+      throw error;
+    });
     moduleCache.set(name, pending);
   }
   return pending;
