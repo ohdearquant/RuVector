@@ -2,7 +2,11 @@
 
 pub mod flat;
 #[cfg(feature = "hnsw")]
+pub(crate) mod flat_graph;
+#[cfg(feature = "hnsw")]
 pub mod hnsw;
+#[cfg(feature = "hnsw")]
+pub mod turbo4;
 
 use crate::error::Result;
 use crate::types::{SearchResult, VectorId};
@@ -22,6 +26,17 @@ pub trait VectorIndex: Send + Sync {
 
     /// Search for k nearest neighbors
     fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>>;
+
+    /// Search with a per-query candidate-list size (HNSW `efSearch`). `None` means the index's configured value.
+    /// Indexes without such a knob ignore it.
+    fn search_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        _ef_search: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
+        self.search(query, k)
+    }
 
     /// Remove a vector from the index
     fn remove(&mut self, id: &VectorId) -> Result<bool>;

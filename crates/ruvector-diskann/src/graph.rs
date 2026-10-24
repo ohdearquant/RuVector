@@ -7,6 +7,7 @@
 
 use crate::distance::{l2_squared, FlatVectors, VisitedSet};
 use crate::error::{DiskAnnError, Result};
+use rand::Rng;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -83,13 +84,25 @@ impl VamanaGraph {
 
     /// Build the Vamana graph over flat vector storage
     pub fn build(&mut self, vectors: &FlatVectors) -> Result<()> {
+        self.build_with_rng(vectors, &mut rand::thread_rng())
+    }
+
+    /// Build the Vamana graph using a caller-provided random-number generator.
+    ///
+    /// This is primarily useful for reproducible tests and benchmarks. Production
+    /// callers should normally use [`Self::build`], which seeds from system entropy.
+    pub fn build_with_rng<R: Rng + ?Sized>(
+        &mut self,
+        vectors: &FlatVectors,
+        rng: &mut R,
+    ) -> Result<()> {
         let n = vectors.len();
         if n == 0 {
             return Err(DiskAnnError::Empty);
         }
 
         self.medoid = self.find_medoid_parallel(vectors);
-        self.init_random_graph(n);
+        self.init_random_graph(n, rng);
 
         let passes = if self.alpha > 1.0 { 2 } else { 1 };
         for pass in 0..passes {
@@ -97,8 +110,8 @@ impl VamanaGraph {
 
             let mut order: Vec<u32> = (0..n as u32).collect();
             {
-                use rand::prelude::*;
-                order.shuffle(&mut rand::thread_rng());
+                use rand::seq::SliceRandom;
+                order.shuffle(rng);
             }
 
             // Reusable visited set (O(1) clear per search)
@@ -341,9 +354,7 @@ impl VamanaGraph {
             .unwrap_or(0)
     }
 
-    fn init_random_graph(&mut self, n: usize) {
-        use rand::prelude::*;
-        let mut rng = rand::thread_rng();
+    fn init_random_graph<R: Rng + ?Sized>(&mut self, n: usize, rng: &mut R) {
         let degree = self.max_degree.min(n - 1);
 
         for i in 0..n {

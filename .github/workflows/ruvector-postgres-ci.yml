@@ -376,20 +376,11 @@ jobs:
 
       - name: Run benchmarks
         run: |
-          cargo bench --features pg17 -- --output-format bencher | tee benchmark-results.txt
+          set -o pipefail
+          cargo bench --no-default-features --features pg17 \
+            --bench distance_bench \
+            -- --output-format bencher | tee benchmark-results.txt
         working-directory: crates/ruvector-postgres
-
-      - name: Store benchmark results
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba
-        with:
-          name: RuVector-Postgres Benchmarks
-          tool: 'cargo'
-          output-file-path: crates/ruvector-postgres/benchmark-results.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: false
-          alert-threshold: '150%'
-          comment-on-alert: true
-          fail-on-alert: false
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

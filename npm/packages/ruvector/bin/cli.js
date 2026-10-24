@@ -1771,10 +1771,24 @@ program
   .description('Graph database operations (requires @ruvector/graph-node)')
   .option('-q, --query <cypher>', 'Execute Cypher query')
   .option('-c, --create <label>', 'Create a node with label')
+  .option('--id <id>', 'Node ID for --create (defaults to a UUID)')
   .option('-p, --properties <json>', 'Node properties as JSON')
   .option('-r, --relate <spec>', 'Create relationship (from:rel:to)')
+  .option('--path <file>', 'Persistent graph database path')
   .option('--info', 'Show graph info and stats')
   .action(async (options) => {
+    const requestedOperation = options.info || options.query || options.create || options.relate;
+    if (!requestedOperation) {
+      console.error(chalk.red('  Specify one of --info, --query, --create, or --relate.'));
+      process.exitCode = 1;
+      return;
+    }
+    if (!options.path) {
+      console.error(chalk.red('  --path <file> is required so graph operations persist across CLI runs.'));
+      process.exitCode = 1;
+      return;
+    }
+
     let graphNode;
     try {
       graphNode = require('@ruvector/graph-node');
@@ -1791,6 +1805,7 @@ program
       console.log(chalk.white('    npx ruvector graph --query "CREATE (n:Person {name: \'Alice\'})"'));
       console.log(chalk.white('    npx ruvector graph --query "MATCH (n) RETURN n"'));
       console.log('');
+      process.exitCode = 1;
       return;
     }
 
@@ -1798,31 +1813,65 @@ program
     console.log(chalk.cyan('                    RuVector Graph'));
     console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
 
-    if (options.info) {
-      console.log(chalk.green('  @ruvector/graph-node is available!'));
-      console.log(chalk.gray(`  Platform: ${process.platform}-${process.arch}`));
-      console.log('');
-      console.log(chalk.yellow('  Available operations:'));
-      console.log(chalk.white('    --query <cypher>    Execute Cypher query'));
-      console.log(chalk.white('    --create <label>    Create node with label'));
-      console.log(chalk.white('    --relate <spec>     Create relationship'));
-      console.log('');
-      return;
-    }
+    try {
+      const GraphDatabase = graphNode.GraphDatabase;
+      if (typeof GraphDatabase !== 'function') {
+        throw new Error('@ruvector/graph-node does not export GraphDatabase');
+      }
 
-    if (options.query) {
-      console.log(chalk.yellow('  Cypher Query:'), chalk.white(options.query));
-      console.log('');
-      // Actual implementation would execute the query
-      console.log(chalk.gray('  Note: Full Cypher execution requires running ruvector-server'));
-      console.log(chalk.gray('  See: npx ruvector server --help'));
-    }
+      const storagePath = path.resolve(options.path);
+      fs.mkdirSync(path.dirname(storagePath), { recursive: true });
+      const db = new GraphDatabase({ storagePath });
 
-    if (options.create) {
-      const label = options.create;
-      const props = options.properties ? JSON.parse(options.properties) : {};
-      console.log(chalk.yellow('  Creating node:'), chalk.white(label));
-      console.log(chalk.gray('  Properties:'), JSON.stringify(props, null, 2));
+      if (options.create) {
+        const parsed = options.properties ? JSON.parse(options.properties) : {};
+        if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+          throw new Error('--properties must be a JSON object');
+        }
+        const properties = Object.fromEntries(
+          Object.entries(parsed).map(([key, value]) => [
+            key,
+            typeof value === 'string' ? value : JSON.stringify(value),
+          ])
+        );
+        const id = options.id || require('crypto').randomUUID();
+        const createdId = await db.createNode({
+          id,
+          labels: [options.create],
+          properties,
+          embedding: new Float32Array(0),
+        });
+        console.log(JSON.stringify({ success: true, operation: 'create', id: createdId, label: options.create, path: storagePath }));
+      }
+
+      if (options.relate) {
+        const parts = options.relate.split(':');
+        if (parts.length !== 3 || parts.some((part) => !part.trim())) {
+          throw new Error('--relate must use the form from:relationship:to');
+        }
+        const [from, description, to] = parts.map((part) => part.trim());
+        const edgeId = await db.createEdge({
+          from,
+          to,
+          description,
+          embedding: new Float32Array(0),
+          confidence: 1,
+        });
+        console.log(JSON.stringify({ success: true, operation: 'relate', id: edgeId, from, relationship: description, to, path: storagePath }));
+      }
+
+      if (options.query) {
+        const result = await db.query(options.query);
+        console.log(JSON.stringify({ success: true, operation: 'query', path: storagePath, result }, null, 2));
+      }
+
+      if (options.info) {
+        const stats = await db.stats();
+        console.log(JSON.stringify({ success: true, operation: 'info', path: storagePath, persistent: db.isPersistent(), stats }, null, 2));
+      }
+    } catch (error) {
+      console.error(chalk.red(`  Graph operation failed: ${error.message}`));
+      process.exitCode = 1;
     }
 
     console.log('');
@@ -3442,7 +3491,13 @@ class Intelligence {
       let entry = null;
       try {
         entry = await this.engine.remember(content, memoryType);
-      } catch {}
+      } catch (e) {
+        // RUVECTOR_EMBEDDER=minilm is an explicit hard requirement. Do not
+        // silently route a failed semantic write through the sync hash path:
+        // that both contradicts the flag and can create mixed provenance.
+        const prov = loadProvenance();
+        if (prov && prov.resolveEmbedderSelection() === 'minilm') throw e;
+      }
       if (entry) {
         // ADR-210 D0: validate provenance BEFORE persisting; provenance
         // refusals propagate (no silent fallback into a mixed store).
@@ -3542,7 +3597,12 @@ class Intelligence {
           timestamp: r.created || new Date().toISOString(),
           score: r.score || 0
         }));
-      } catch {}
+      } catch (e) {
+        // Preserve the hard-fail contract for an explicitly selected MiniLM
+        // embedder instead of disguising model failures as hash recall.
+        const prov = loadProvenance();
+        if (prov && prov.resolveEmbedderSelection() === 'minilm') throw e;
+      }
     }
     return this.recall(query, topK);
   }
@@ -4768,11 +4828,38 @@ hooksCmd.command('suggest-context').description('Suggest relevant context').acti
   console.log(`RuVector Intelligence: ${stats.total_patterns} learned patterns, ${stats.total_errors} error fixes available. Use 'ruvector hooks route' for agent suggestions.`);
 });
 
+/**
+ * Choose the hook embedder without bypassing ADR-210's rollout flags.
+ * Existing stores are authoritative under `auto`: an ONNX-stamped store uses
+ * the async semantic path and a hash-stamped store keeps the fast hash path.
+ * Fresh stores retain the historical fast default unless the operator
+ * explicitly requests auto/minilm through the environment or --semantic.
+ */
+function hooksUseSemanticEmbedder(intel, forceSemantic) {
+  if (forceSemantic) return true;
+  const prov = loadProvenance();
+  if (!prov) return false;
+  const selection = prov.resolveEmbedderSelection();
+  if (selection === 'minilm') return true;
+  if (selection === 'hash') return false;
+
+  const stored = intel.storedProvenance();
+  if (stored) return stored.embedderKind === 'onnx-minilm';
+
+  // `auto` is also the implicit library default. Only opt a fresh CLI store
+  // into the slower path when the user supplied a rollout flag explicitly.
+  const explicitAuto = String(process.env.RUVECTOR_EMBEDDER || '').trim().toLowerCase() === 'auto';
+  const legacyOnnx = String(process.env.RUVECTOR_ONNX || '').trim() === '1';
+  return explicitAuto || legacyOnnx;
+}
+
 hooksCmd.command('remember').description('Store in memory').requiredOption('-t, --type <type>', 'Memory type').option('--silent', 'Suppress output').option('--semantic', 'Use ONNX semantic embeddings (slower, better quality)').argument('<content...>', 'Content').action(async (content, opts) => {
   const intel = new Intelligence();
+  let semantic = false;
   try {
     let id;
-    if (opts.semantic) {
+    semantic = hooksUseSemanticEmbedder(intel, opts.semantic);
+    if (semantic) {
       // Use async ONNX embedding
       id = await intel.rememberAsync(opts.type, content.join(' '));
     } else {
@@ -4787,12 +4874,12 @@ hooksCmd.command('remember').description('Store in memory').requiredOption('-t, 
     }
     intel.save();
     if (!opts.silent) {
-      console.log(JSON.stringify({ success: true, id, semantic: !!opts.semantic }));
+      console.log(JSON.stringify({ success: true, id, semantic }));
     }
   } catch (e) {
     // ADR-210 D0: mismatched/legacy vector writes are refused, not coerced.
     if (!opts.silent) {
-      console.log(JSON.stringify({ success: false, error: e.message, code: e.code || 'ERR_EMBEDDING_PROVENANCE' }));
+      console.log(JSON.stringify({ success: false, semantic, error: e.message, code: e.code || 'ERR_EMBEDDING_PROVENANCE' }));
     }
     process.exitCode = 1;
   }
@@ -4801,12 +4888,13 @@ hooksCmd.command('remember').description('Store in memory').requiredOption('-t, 
 hooksCmd.command('recall').description('Search memory').argument('<query...>', 'Query').option('-k, --top-k <n>', 'Results', '5').option('--semantic', 'Use ONNX semantic search (slower, better quality)').action(async (query, opts) => {
   const intel = new Intelligence();
   let results;
-  if (opts.semantic) {
+  const semantic = hooksUseSemanticEmbedder(intel, opts.semantic);
+  if (semantic) {
     results = await intel.recallAsync(query.join(' '), parseInt(opts.topK));
   } else {
     results = intel.recall(query.join(' '), parseInt(opts.topK));
   }
-  console.log(JSON.stringify({ query: query.join(' '), semantic: !!opts.semantic, results: results.map(r => ({ type: r.memory_type || 'unknown', content: (r.content || '').slice(0, 200), timestamp: r.timestamp || '', score: r.score })) }, null, 2));
+  console.log(JSON.stringify({ query: query.join(' '), semantic, results: results.map(r => ({ type: r.memory_type || 'unknown', content: (r.content || '').slice(0, 200), timestamp: r.timestamp || '', score: r.score })) }, null, 2));
 });
 
 // ADR-210 D1: maintenance command — re-embed hash-era memories with the
@@ -9903,7 +9991,14 @@ routeCmd.command('info')
   .option('--json', 'JSON output')
   .action(async (opts) => {
     let routerAvailable = false, routerVersion = 'N/A', metrics = {};
-    try { const router = require('@ruvector/router'); routerAvailable = true; routerVersion = router.version || '0.1.28'; const sr = new router.SemanticRouter({ dimension: 16 }); metrics = { distanceMetrics: Object.keys(router.DistanceMetric || {}), hasSemanticRouter: true }; } catch (e) { /* Not available */ }
+    try {
+      const router = require('@ruvector/router'); routerAvailable = true;
+      // @ruvector/router does not export a `version`, so the old `|| '0.1.28'`
+      // fallback printed 0.1.28 for every installed version. Read the package
+      // manifest instead; fall back to "unknown", never to a stale literal.
+      try { routerVersion = router.version || require('@ruvector/router/package.json').version || 'unknown'; } catch { routerVersion = router.version || 'unknown'; }
+      const sr = new router.SemanticRouter({ dimension: 16 }); metrics = { distanceMetrics: Object.keys(router.DistanceMetric || {}), hasSemanticRouter: true };
+    } catch (e) { /* Not available */ }
     const info = { package: '@ruvector/router', available: routerAvailable, version: routerVersion, backend: 'Rust NAPI (HNSW + SIMD)', features: ['Semantic intent matching', 'HNSW indexing', 'SIMD-accelerated search', 'Multiple distance metrics', 'Save/load state', 'Async embedding support'], ...metrics };
     if (opts.json) { console.log(JSON.stringify(info, null, 2)); return; }
     console.log(chalk.bold.cyan('\n  Semantic Router Information\n'));
