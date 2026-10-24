@@ -4,6 +4,19 @@
 
 Python access to the ten most downloaded RuVector npm packages. Eight new companion distributions join the existing `ruvector` SDK and `ruvector-graph`. Previously released clustering and reranking remain available. Every companion has its own introduction, animated diagram, runnable getting started example and explicit capability limits.
 
+## Release status, October 12, 2026
+
+The 0.2.0 portfolio is **partially published**. Attention and cluster wheels are
+available; both source archives and nine target releases are still missing.
+The original files pin native `ruvector==0.1.3`. Current source targets 0.1.4
+and must not replace immutable 0.2.0 artifacts. See the
+[verified inventory and recovery evidence](../../docs/python-portfolio/evidence/2026-10-12/README.md)
+and [recovery design](../../docs/python-portfolio/resume-release-adr.md).
+
+The published attention package has a
+[tested synthetic-data tutorial](tutorials/README.md). Other implemented tracks
+below describe source capabilities and do not establish PyPI availability.
+
 ## Which packages are most popular?
 
 Measured npm downloads for September 11 through October 10, 2026. These are package retrievals, not unique users. Platform binary variants are excluded. RVF WASM remains a separate distribution because it provides a distinct portable execution backend. [Raw evidence and all source URLs](npm-popularity-2026-10-11.json).
@@ -26,7 +39,8 @@ Measured npm downloads for September 11 through October 10, 2026. These are pack
 ```sh
 python -m venv .venv
 # Activate the environment using your platform's normal command.
-python -m pip install ruvector-core==0.2.0 ruvector-router==0.2.0
+python -m pip install ruvector-attention==0.2.0 ruvector==0.1.3 numpy==2.2.6
+# Run the published-package example in tutorials/attention_quickstart.py.
 ```
 
 Choose a task and open its package guide:
