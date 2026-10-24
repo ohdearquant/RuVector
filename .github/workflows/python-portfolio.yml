@@ -92,6 +92,9 @@ jobs:
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: python python/portfolio/audit_native.py /tmp/portfolio-native.lock
   publish:
+    concurrency:
+      group: python-portfolio-pypi
+      cancel-in-progress: false
     needs: [test-build, native-audit]
     if: needs.test-build.outputs.release == 'true'
     runs-on: ubuntu-latest

@@ -140,7 +140,8 @@ jobs:
   # faster test discovery and execution.
   test:
     name: Tests (${{ matrix.name }})
-    runs-on: ubuntu-22.04
+    # ORT prebuilt binaries require glibc 2.38+ and GCC 13 libstdc++.
+    runs-on: ${{ matrix.name == 'core-and-rest' && 'ubuntu-24.04' || 'ubuntu-22.04' }}
     # `core-and-rest` is the catch-all shard and compiles ~50 crates; on a
     # cold cache the build alone has hit ~90min, so headroom matters more
     # than tight feedback for this job. Faster shards still finish in ~10–20m.
